@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>双语绘本 · 纸书智伴</title>
+  <link rel="stylesheet" href="player.css">
+  <script defer src="book.js"></script>
+  <script defer src="player.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="wrap top">
+      <div class="brand"><span class="blocks" aria-hidden="true"><i></i><i></i><i></i></span> 纸书智伴</div>
+      <button id="quiz-top" class="quiet" type="button">阅读小测 <span aria-hidden="true">↗</span></button>
+    </div>
+  </header>
+  <main class="wrap">
+    <div class="book-heading">
+      <div>
+        <h1 id="book-title"></h1>
+        <p id="edition-note"></p>
+      </div>
+      <div class="media-status" id="media-status" aria-live="polite"></div>
+    </div>
+    <div class="book-grid">
+      <section class="player" id="player" aria-label="绘本播放器">
+        <div class="scene-head">
+          <span id="scene-number" class="scene-number">01</span>
+          <h2 id="scene-title"></h2>
+          <span class="page-tag" id="scene-page">PDF 第 2 页</span>
+        </div>
+        <div class="stage" id="stage" aria-label="故事画面">
+          <img id="frame" alt="" draggable="false">
+          <video id="video" muted playsinline preload="metadata" hidden></video>
+          <div id="hotspots" class="hotspots" hidden></div>
+          <div id="welcome" class="welcome">
+            <button class="start" type="button" id="start"><i class="play-icon" aria-hidden="true"></i> 开始观看</button>
+          </div>
+          <span id="frame-note" class="frame-note" hidden>首帧观察 · 点一下标记</span>
+        </div>
+        <div class="subtitle-space"><p id="caption" class="caption" hidden></p></div>
+        <div class="controls">
+          <label class="progress-line">
+            <span class="sr-only">全书进度</span>
+            <input type="range" id="timeline" min="0" max="1" step="0.01" value="0">
+            <output id="timestamp" aria-live="off">0:00 / 0:00</output>
+          </label>
+          <div class="control-buttons">
+            <button type="button" class="icon-button" id="prev" aria-label="上一幕" title="上一幕"><span aria-hidden="true">‹</span></button>
+            <button type="button" class="circle-play" id="play" aria-label="播放" title="播放"><i class="play-icon" aria-hidden="true"></i></button>
+            <button type="button" class="icon-button" id="next" aria-label="下一幕" title="下一幕"><span aria-hidden="true">›</span></button>
+            <span class="control-spacer"></span>
+            <button type="button" id="find" class="control-text" aria-pressed="false">找一找</button>
+            <label class="reader-select"><span id="voice-label">配音</span><select id="language"><option value="zh">中文</option><option value="en">English</option></select></label>
+            <label class="reader-select"><span id="cc-label">字幕</span><select id="cc"><option value="auto">跟随配音</option><option value="both">中英双行</option><option value="zh">中文</option><option value="en">English</option><option value="off">关闭</option></select></label>
+            <button type="button" id="fullscreen" class="icon-button" title="全屏" aria-label="全屏"><i class="full-icon" aria-hidden="true"></i></button>
+          </div>
+        </div>
+      </section>
+      <aside class="companion" aria-label="故事伙伴">
+        <div class="companion-head">
+          <span class="blocks" aria-hidden="true"><i></i><i></i><i></i></span>
+          <div><h2>故事伙伴</h2><p>陪你一起看这本书</p></div>
+        </div>
+        <div class="tabs" role="group" aria-label="故事伙伴功能">
+          <button id="objects-tab" type="button" aria-pressed="true">找一找</button>
+          <button id="ask-tab" type="button" aria-pressed="false">问一问</button>
+        </div>
+        <div id="objects-panel" class="panel">
+          <div class="panel-content">
+            <p id="objects-intro">点一下物品，听听它的故事。</p>
+            <div id="object-list" class="chips"></div>
+            <div id="object-answer" class="answer" aria-live="polite" hidden></div>
+          </div>
+          <button class="outline resume" id="continue" type="button" hidden>从原处继续播放 <span aria-hidden="true">›</span></button>
+        </div>
+        <div id="ask-panel" class="panel" hidden>
+          <div class="panel-content">
+            <div class="chat" id="chat" aria-live="polite"></div>
+            <div class="chips" id="suggestions"></div>
+          </div>
+          <form id="ask-form" class="ask-form">
+            <label for="ask-input" class="sr-only">输入故事问题</label>
+            <input id="ask-input" autocomplete="off" placeholder="问一问故事里的事" maxlength="140" required>
+            <button type="button" class="mic" id="ask-mic" aria-label="语音提问" title="语音提问"><i class="mic-icon" aria-hidden="true"></i></button>
+            <button type="submit" class="send">发送</button>
+          </form>
+          <p class="voice-status" id="ask-voice-status" role="status"></p>
+          <button class="outline resume" id="ask-continue" type="button" hidden>从原处继续播放 <span aria-hidden="true">›</span></button>
+        </div>
+      </aside>
+    </div>
+    <section class="scenes" aria-label="故事分幕">
+      <div class="scenes-heading">
+        <h2>故事分幕 <span id="shot-count"></span></h2>
+        <div class="rail-controls">
+          <button id="rail-prev" class="icon-button" type="button" aria-label="向左浏览分幕">‹</button>
+          <button id="rail-next" class="icon-button" type="button" aria-label="向右浏览分幕">›</button>
+        </div>
+      </div>
+      <div id="scenes" class="scene-rail"></div>
+    </section>
+  </main>
+  <dialog id="quiz" aria-labelledby="quiz-title">
+    <div class="quiz-shell">
+      <div class="quiz-header">
+        <h2 id="quiz-title">阅读小测</h2>
+        <button class="icon-button" id="quiz-close" type="button" aria-label="关闭小测">×</button>
+      </div>
+      <div id="quiz-body"></div>
+      <div id="quiz-actions" class="quiz-actions"></div>
+    </div>
+  </dialog>
+  <template id="evidence-template">
+    <button class="evidence" type="button"><img alt=""><span></span></button>
+  </template>
+  <audio id="narration" preload="auto"></audio>
+  <audio id="explanation" preload="none"></audio>
+</body>
+</html>

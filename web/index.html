@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>纸书智伴 · 绘本制作台</title>
+  <link rel="stylesheet" href="/studio.css">
+  <link rel="stylesheet" href="/library.css">
+  <script src="/refine.js" defer></script>
+  <script src="/studio.js" defer></script>
+  <script src="/library.js" defer></script>
+</head>
+<body>
+  <header class="mast">
+    <div class="mast-inner">
+      <a href="#home" class="brand" aria-label="纸书智伴首页"><span class="binding" aria-hidden="true"></span>纸书智伴</a>
+      <nav class="navigation" aria-label="主导航">
+        <a href="#home" data-page="home">首页</a>
+        <a href="#text" data-page="text">文生绘本</a>
+        <a href="#pdf" data-page="pdf">图生绘本</a>
+        <a href="#library" data-page="library">绘本资料</a>
+      </nav>
+    </div>
+  </header>
+  <main>
+    <section id="home-page" class="app-page">
+      <header class="page-heading"><h1>故事书架</h1><p>选一本再次阅读，也可以留下评分和意见。</p></header>
+      <div id="home-books" class="book-grid"></div>
+    </section>
+    <section id="text-page" class="app-page" hidden>
+      <header class="page-heading"><h1>文生绘本</h1><p>把孩子想认识的事，写进一个为他创作的故事。</p></header>
+      <form id="text-form" class="creation">
+        <section class="creation-card story-settings">
+          <h2>故事设定</h2>
+          <div class="story-fields">
+            <label class="field">故事主题<input name="theme" required maxlength="600" placeholder="例如：帮迷路的小蜜蜂回家"></label>
+            <label class="field">主要角色<input name="characters" required maxlength="600" placeholder="例如：小狐狸和一只小蜜蜂"></label>
+            <label class="field">场景设定<input name="setting" required maxlength="600" placeholder="例如：春天的花园"></label>
+          </div>
+          <div class="presets" aria-label="填入故事示例">
+            <button type="button" data-preset="bees">花园里的蜜蜂</button>
+            <button type="button" data-preset="moon">月亮的形状</button>
+            <button type="button" data-preset="share">一起分享</button>
+          </div>
+        </section>
+        <div class="creation-rows">
+          <section class="creation-card controls">
+            <label class="field teaching">教学目标<textarea name="education" rows="3" required maxlength="600" placeholder="例如：知道蜜蜂采蜜时也会给花朵传粉"></textarea></label>
+            <div class="voice-chooser"></div>
+            <button class="primary create-button" type="submit">生成整本绘本</button>
+          </section>
+          <section class="preview-panel" id="text-preview" aria-label="制作进度和完整绘本预览"></section>
+        </div>
+      </form>
+    </section>
+    <section id="pdf-page" class="app-page" hidden>
+      <header class="page-heading"><h1>图生绘本</h1><p>上传原书，按故事分镜制作带配音和互动的绘本。</p></header>
+      <form id="pdf-form" class="creation">
+        <section class="creation-card story-settings">
+          <h2>原书 PDF</h2>
+          <label id="pdf-drop" class="dropzone" for="file">
+            <span class="upload-mark" aria-hidden="true">↑</span>
+            <span id="file-label">选择或拖入 PDF 绘本</span>
+            <small>PDF 文件，最大 512 MB</small>
+          </label>
+          <input id="file" class="visually-hidden" name="pdf" type="file" accept="application/pdf,.pdf" required>
+        </section>
+        <div class="creation-rows">
+          <section class="creation-card controls">
+            <label class="field teaching">补充教学目标（选填）<textarea name="education" rows="3" maxlength="600" placeholder="例如：留意故事里的轮流和分享"></textarea></label>
+            <div class="voice-chooser"></div>
+            <button class="primary create-button" type="submit">生成整本绘本</button>
+          </section>
+          <section class="preview-panel" id="pdf-preview" aria-label="制作进度和完整绘本预览"></section>
+        </div>
+      </form>
+    </section>
+    <section id="library-page" class="app-page" hidden>
+      <header class="page-heading"><h1>绘本资料</h1><p>重播整本绘本，查看评价，或重新制作其中一幕。</p></header>
+      <div id="library-books" class="book-grid"></div>
+      <section id="workspace" class="workspace" hidden aria-label="绘本的分镜与资料">
+        <div class="book-heading">
+          <div><h2 id="title"></h2><p id="summary"></p></div>
+          <div class="row"><button class="save" id="save" disabled>保存修改</button><button id="close-editor">关闭资料面板</button></div>
+        </div>
+        <div id="book-feedback"></div>
+        <nav class="steps" aria-label="编辑工具">
+          <button type="button" data-tab="layout" aria-current="step">分镜</button>
+          <button type="button" data-tab="profile">资料卡</button>
+          <button type="button" data-tab="script">清图与台词</button>
+          <button type="button" data-tab="output">导出与高级制作</button>
+        </nav>
+        <div id="status" role="status" hidden></div>
+        <div id="view"></div>
+      </section>
+    </section>
+    <footer class="studio-footer">
+      <span id="connections" title="本机 API 配置"></span>
+      <div class="row"><a href="/skills.md" download>制作提示词</a><a href="/skill.zip" download>技能包</a></div>
+    </footer>
+    <div id="message" role="alert" hidden></div>
+  </main>
+  <dialog id="rating-dialog" class="rating-dialog">
+    <form id="rating-form">
+      <h2>评价绘本</h2>
+      <p id="rating-book"></p>
+      <fieldset>
+        <legend>评分（必填）</legend>
+        <div class="rating-choices" aria-label="从 1 分至 5 分"></div>
+      </fieldset>
+      <label class="field">详细的不足（选填）<textarea name="notes" rows="4" maxlength="2000" placeholder="例如：这一幕的动作跟朗读没有对上"></textarea></label>
+      <div class="actions"><button class="primary" type="submit">保存评价</button><button id="cancel-rating" type="button">取消</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

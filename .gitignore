@@ -1,0 +1,16 @@
+/作品/
+/output/
+/cache/
+/assets/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.pem
+*.key
+*.log
+*.zip
+*.pdf
+*.mp4
+*.wav
