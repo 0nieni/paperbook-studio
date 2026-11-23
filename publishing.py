@@ -77,6 +77,11 @@ def publish(root,book,scenes,partial,proof=False):
              "video_receipts":{s["id"]:s.get("video_source") or {"model":api.VIDEO,"id":s.get("task",{}).get("id","")} for s in scenes if s.get("video")},"scenes":[{k:s[k] for k in
                   ("id","title","summary","parts","sources","script")} for s in scenes],
              "regions":[r for r in book["regions"] if any(r["page"] in s["pages"] for s in model["scenes"])]}
+    # Freeze generation evidence alongside the edition that the family can rate.
+    context["creation"] = book.get("creation", {})
+    context["rsi_assigned_at"] = book.get("rsi_assigned_at",0)
+    for record, scene in zip(context["scenes"],scenes):
+        record.update({k:scene[k] for k in ("visual","art_prompt","clean_instruction","rsi_used","clean_review","video_seconds") if k in scene})
     template=api.ROOT/"reader"
     template_hash=hashlib.sha256(b"".join(p.read_bytes() for p in sorted(template.iterdir()) if p.is_file())).hexdigest()
     key=api.digest(model,context,template_hash)

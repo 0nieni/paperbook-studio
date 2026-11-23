@@ -84,6 +84,14 @@
           <div class="row"><button class="save" id="save" disabled>保存修改</button><button id="close-editor">关闭资料面板</button></div>
         </div>
         <div id="book-feedback"></div>
+        <details class="feedback-panel" id="rsi-panel">
+          <summary>RSI 制作复盘</summary>
+          <div class="rsi-controls">
+            <button id="rsi-edition" type="button">评估播放版</button>
+            <button id="rsi-draft" type="button">评估当前分镜</button>
+          </div>
+          <div id="rsi-results" aria-live="polite"></div>
+        </details>
         <nav class="steps" aria-label="编辑工具">
           <button type="button" data-tab="layout" aria-current="step">分镜</button>
           <button type="button" data-tab="profile">资料卡</button>
@@ -100,6 +108,18 @@
     </footer>
     <div id="message" role="alert" hidden></div>
   </main>
+  <dialog id="redraw-dialog" class="rating-dialog" aria-labelledby="redraw-title">
+    <form id="redraw-form">
+      <h2 id="redraw-title">重画分镜</h2>
+      <p id="redraw-scene"></p>
+      <label class="field">本幕插画提示词<textarea name="prompt" rows="6" required maxlength="20000"></textarea></label>
+      <button id="redraw-use-rsi" type="button" hidden>采用 RSI 修订稿</button>
+      <label class="field">补充修改要求（选填）<textarea name="note" rows="3" maxlength="1000" placeholder="例如，把青蛙移到画面左侧，让井口的天空更明亮。"></textarea></label>
+      <p class="hint">重画使用千问。完成后，RSI 会根据本次修改和新画面修订本幕提示词。</p>
+      <p id="redraw-error" role="alert" hidden></p>
+      <div class="actions"><button type="submit" class="primary">开始重画</button><button id="cancel-redraw" type="button">取消</button></div>
+    </form>
+  </dialog>
   <dialog id="rating-dialog" class="rating-dialog">
     <form id="rating-form">
       <h2>评价绘本</h2>

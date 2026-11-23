@@ -66,7 +66,7 @@ def blend_repair(base, candidate, mask):
     return Image.composite(candidate,base,feather)
 
 
-def repair_crop(frame, mask, text):
+def repair_crop(frame, mask, text, note=""):
     """Give the edit model one visible target at a useful reading size and blend only its ink area."""
     x,y,r,b=mask.getbbox()
     margin=max(28,round(max(r-x,b-y)*.27))
@@ -80,13 +80,13 @@ def repair_crop(frame, mask, text):
     overlay=local_mask.resize(size,Image.Resampling.NEAREST)
     ImageDraw.Draw(marked).rectangle(overlay.getbbox(),outline="#ff2338",width=max(3,round(size[0]/220)))
     from providers import edit_art
-    edited=edit_art(source,marked,text).resize(crop.size,Image.Resampling.LANCZOS)
+    edited=edit_art(source,marked,text,note).resize(crop.size,Image.Resampling.LANCZOS)
     frame=frame.copy()
     frame.paste(blend_repair(crop,edited,local_mask),bounds[:2])
     return frame
 
 
-def repair_before_crop(root, scene, region, regions):
+def repair_before_crop(root, scene, region, regions, note=""):
     """Recover a whole printed line on its source page when only a fragment falls inside a panel."""
     n = region["page"]
     marks = [r for r in regions if r["page"] == n and r["kind"] in REMOVE]
@@ -101,7 +101,7 @@ def repair_before_crop(root, scene, region, regions):
         if r["page"] == n and r["kind"] in {"prop", "mark"}:
             rectangle(r, 0)
     if mask.getbbox():
-        fixed = repair_crop(paper, mask, region["text"])
+        fixed = repair_crop(paper, mask, region["text"], note)
         if colored_ink_survives(paper, fixed, mask):
             fixed = restore_print_ink(paper, mask)
     else:

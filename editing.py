@@ -93,6 +93,7 @@ def edit(root,book,body):
         prior_regions=prod.region_set(was,book["regions"]) if was else []
         geometry=parts!=was.get("parts") or current_regions!=prior_regions
         if geometry:
+            s.get("rsi_used",{}).pop("text2image",None)
             for key in ("frame","original","clean_review","clean_approved"):
                 s.pop(key,None)
         elif was.get("clean_review") and inp.get("clean_approved") is True:
@@ -109,11 +110,16 @@ def edit(root,book,body):
             if not was.get("video"):
                 metadata |= before!=after
         if geometry or metadata:
+            s.pop("clean_instruction",None)
+            s.get("rsi_used",{}).pop("story",None)
             prod.clear_script(s)
             activities_changed=True
         elif was.get("script") and inp.get("script") is not None:
             script=ed.validate_script(inp["script"],s)
             if script!=was["script"]:
+                for role, key in (("tts","lines"),("image2video","video_prompt"),("interaction","spots")):
+                    if script[key]!=was["script"][key]:
+                        s.get("rsi_used",{}).pop(role,None)
                 activities_changed |= (script["spots"]!=was["script"]["spots"] or
                                        [(t["role"],t["zh"],t["en"]) for t in script["lines"]] !=
                                        [(t["role"],t["zh"],t["en"]) for t in was["script"]["lines"]])
@@ -123,12 +129,14 @@ def edit(root,book,body):
                                 [(x["id"],x["explain"][l]) for x in d["spots"]])
                     if voice_copy(script)!=voice_copy(was["script"]):
                         s.get("audio",{}).pop(l,None)
+                        s.get("narration",{}).pop(l,None)
                 if script["video_prompt"]!=was["script"]["video_prompt"]:
-                    for key in ("video","video_seconds","video_source","task"):
+                    for key in ("video","video_seconds","video_source","task","planned_video_seconds"):
                         s.pop(key,None)
             s["script"]=script
         if model!=book["tts_model"]:
             s.pop("audio",None)
+            s.pop("narration",None)
         scenes.append(s)
     unique(scenes)
     if activities_changed:
