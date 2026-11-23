@@ -19,9 +19,11 @@ import editorial as ed
 import providers as api
 import motion
 import original_story
+from rsi import instructions
 
 LANGS = ("zh","en")
 ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+VOICE_LOCKS = [Lock() for _ in range(64)]
 
 
 def initialize(root, name, creation=None):
@@ -90,9 +92,11 @@ def analyze(root,book,notice):
     for page in book["pages"]:
         n = page["n"]
         notice(f"DeepSeek 阅读第 {n}/{len(book['pages'])} 页与相邻跨页")
-        layouts.append(ed.read_page(root,book["pages"],n,layouts[-1] if layouts else {}))
+        layouts.append(ed.read_page(root,book["pages"],n,layouts[-1] if layouts else {},book))
     ed.check_spreads(root,layouts,notice)
     scenes,regions = ed.join_layout(layouts)
+    for scene in scenes:
+        instructions.stamp(scene,book,"story")
     if not scenes:
         raise ValueError("没有识别出故事画面，可从网页手工添加场景。")
     notice("整理全书资料、教育主题与角色参考图")
@@ -122,8 +126,56 @@ def artifact(root, prefix, data, ext):
 
 
 def clear_script(scene):
-    for key in ("script","audio","video","video_seconds","video_source","task"):
+    for role in ("tts","image2video","interaction"):
+        scene.get("rsi_used",{}).pop(role,None)
+    for key in ("script","cue_plan","redraw_lines","narration","planned_video_seconds","audio","video","video_seconds","video_source","task"):
         scene.pop(key,None)
+
+
+def redraw_scene(root,book,sid,notice,note="",edited_prompt=None):
+    scene = next((s for s in book["scenes"] if s["id"]==sid),None)
+    if not scene:
+        raise ValueError("请选择要重画的分镜。")
+    if scene.get("task",{}).get("state") in {"pending","submitting"}:
+        raise ValueError("本幕已有视频任务，请先核对任务结果，再重画首帧。")
+    if scene.get("needs_illustration") or not all(art.pagefile(root,p["page"]).is_file() for p in scene["parts"]):
+        raise ValueError("本幕原页尚未生成，请先完成原页插画。")
+
+    original,_,_ = art.compose(root,scene,[])
+    reference = original
+    if scene.get("frame") and (root/"assets"/scene["frame"]).is_file():
+        with Image.open(root/"assets"/scene["frame"]) as im:
+            reference = im.convert("RGB")
+    profile = book["profile"]
+    previous = scene.get("art_prompt") or scene["summary"] or scene["title"]
+    design = edited_prompt if edited_prompt is not None else previous
+    if note:
+        design += "\n本次修改：" + note
+    prompt = (f"参考随附的本幕画面，重新绘制一张 16:9 儿童绘本分镜。保持角色身份、画风与故事连续。"
+              f"\n全书画风：{profile.get('style','')}\n当前场景名：{scene['title']}\n当前情节：{scene['summary']}。"
+              "\n画面干净，保留道具细节，去除旁白、对话气泡和字幕。"
+              f"\n请按家长确认的本幕提示词作画，其中本次修改优先：\n{design}")
+    prompt = instructions.apply(prompt,book,"text2image")
+    notice(f"千问正在重画「{scene['title']}」")
+    picture = api.illustrate(prompt,reference)
+    frame = artifact(root,"frame",art.image_bytes(picture),"png")
+    source = artifact(root,"original",art.image_bytes(original),"png")
+    plan = scene.get("script") or scene.get("cue_plan") or {}
+    lines = plan.get("lines") or scene.get("redraw_lines")
+    narration = dict(scene.get("narration",{}))
+    narration.update({lang:{k:v for k,v in track.items() if k!="spots"} for lang,track in scene.get("audio",{}).items()})
+    if frame != scene.get("frame"):
+        clear_script(scene)
+        if lines:
+            scene["redraw_lines"] = lines
+            scene["narration"] = narration
+        book.update(activities=None,faq_audio={})
+    scene.update(original=source,frame=frame,redrawn_frame=frame,clean_review=[],art_prompt=design,
+                 redraw_edit={"id":uuid.uuid4().hex,"scene":sid,"title":scene["title"],"before":previous,
+                              "after":design,"note":note,"sent":prompt,"frame":frame})
+    scene.pop("clean_approved",None)
+    instructions.stamp(scene,book,"text2image")
+    write(root,book)
 
 
 def clean(root,book,scene,force=False):
@@ -145,13 +197,14 @@ def clean(root,book,scene,force=False):
             if mask.getbbox():
                 visible[r["id"]]=(r,mask)
     cloud_regions = [{k:v for k,v in region.items() if not k.startswith("ink_")} for region in regions]
+    art_note = instructions.apply(scene.get("clean_instruction",""),book,"text2image")
     def fix(ids,pass_number):
         nonlocal frame
         for rid in ids:
             r,mask=visible[rid]
             partial = all(art.area(art.intersection(part["box"],r["box"])) < .8*art.area(r["box"])
                           for part in scene["parts"] if part["page"]==r["page"])
-            fingerprint=api.digest(("whole-line-1" if partial else "region-2") if pass_number==0 else "ink-recovery-1",scene["parts"],cloud_regions,list(ids),rid,pass_number)
+            fingerprint=api.digest(("whole-line-1" if partial else "region-2") if pass_number==0 else "ink-recovery-1",scene["parts"],cloud_regions,list(ids),rid,pass_number,*([art_note] if art_note else []))
             cached=root/"cache"/("repair-"+fingerprint+".png")
             if cached.exists() and not force:
                 with Image.open(cached) as image:
@@ -161,10 +214,10 @@ def clean(root,book,scene,force=False):
                     recovered=art.restore_print_ink(before_raster_edit,mask)
                     frame=Image.composite(recovered,frame,mask)
                 elif partial:
-                    restored = art.repair_before_crop(root,scene,r,regions)
+                    restored = art.repair_before_crop(root,scene,r,regions,art_note)
                     frame = Image.composite(restored,frame,mask)
                 else:
-                    frame=art.repair_crop(frame,mask,r["text"])
+                    frame=art.repair_crop(frame,mask,r["text"],art_note)
                 api.atomic(cached,art.image_bytes(frame))
     def apply_outlines():
         nonlocal frame
@@ -199,19 +252,22 @@ def clean(root,book,scene,force=False):
         book["faq_audio"] = {}
     scene["original"] = artifact(root,"original",art.image_bytes(original),"png")
     scene["frame"] = name
+    if visible:
+        instructions.stamp(scene,book,"text2image")
 
 
 def recording(root,text,instruction,lang,model,tone=None):
     key = api.digest(model,tone or api.VOLUME,lang,text,instruction if model==api.TTS else "")
     name = "voice-"+key+".wav"
     path = root/"assets"/name
-    if not path.exists():
-        api.atomic(path,api.voice(text,instruction,lang,model,tone))
-    else:
-        raw=path.read_bytes()
-        normalized=api.complete_wave(raw)
-        if normalized!=raw:
-            api.atomic(path,normalized)
+    with VOICE_LOCKS[int(key[:2],16) % len(VOICE_LOCKS)]:
+        if not path.exists():
+            api.atomic(path,api.voice(text,instruction,lang,model,tone))
+        else:
+            raw=path.read_bytes()
+            normalized=api.complete_wave(raw)
+            if normalized!=raw:
+                api.atomic(path,normalized)
     return name
 
 
@@ -241,19 +297,27 @@ def assemble(root,clips):
     return {"file":name,"duration":samples/rate,"cues":cues}
 
 
-def synthesize(root,book,scene,lang,notice):
-    sc = scene["script"]
+def narrate(root,book,scene,lang,notice):
+    sc = scene.get("script") or scene["cue_plan"]
     clips = []
     for i,line in enumerate(sc["lines"],1):
         notice(f"{scene['title']} · {lang.upper()} 配音 {i}/{len(sc['lines'])}")
         name = recording(root,line[lang],line["direction"][lang],lang,*recording_style(book,lang))
         clips.append((line["id"],name))
-    result = assemble(root,clips)
+    return assemble(root,clips)
+
+
+def add_spot_audio(root,book,scene,lang,result,notice):
     result["spots"] = {}
-    for h in sc["spots"]:
+    for h in scene["script"]["spots"]:
         notice(f"{scene['title']} · {lang.upper()} 物品讲解")
         result["spots"][h["id"]] = recording(root,h["explain"][lang],explanation_direction(lang),lang,*recording_style(book,lang))
-    scene.setdefault("audio",{})[lang] = result
+    return result
+
+
+def synthesize(root,book,scene,lang,notice):
+    track = scene.get("narration",{}).get(lang) or narrate(root,book,scene,lang,notice)
+    scene.setdefault("audio",{})[lang] = add_spot_audio(root,book,scene,lang,track,notice)
 
 
 def explanation_direction(lang):
@@ -273,12 +337,14 @@ def faq_speech(root,book,langs,notice,save):
 def animate_book(root, book, scenes, notice):
     unfinished = [scene for scene in scenes if not scene.get("video") or not (root/"assets"/scene["video"]).is_file()]
     for scene in unfinished:
-        if any(lang not in scene.get("audio", {}) for lang in languages(book)):
-            raise ValueError(f"请先完成「{scene['title']}」的配音。")
+        if not scene.get("frame") or not scene.get("script"):
+            raise ValueError(f"请先完成「{scene['title']}」的首帧和动作提示。")
         if scene.get("clean_review") and not scene.get("clean_approved"):
             raise ValueError(f"请先核对「{scene['title']}」的清图对照。")
+        motion.pin_duration(scene,languages(book))
     if not unfinished:
         return
+    write(root,book)
     service = book.get("video_provider", "heygen")
     lock = Lock()
     recipe_locks = {motion.render_recipe(s,service)[0]:Lock() for s in unfinished}
@@ -321,23 +387,46 @@ def recover(root,book,sid,task):
     journal={"id":task,"state":"pending" if task else "failed"}
     service = s["task"].get("provider", "minimax")
     journal["provider"] = service
+    if s["task"].get("auth"):
+        journal["auth"] = s["task"]["auth"]
     api.save_json(motion.directory_record(root,service,s["task"]["key"]),journal)
     s["task"].update(journal)
     write(root,book)
 
 
-def make(root,book,action,sid,lang,notice):
+def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
     save = lambda:write(root,book)
+    if action=="redraw_scene":
+        redraw_scene(root,book,sid,notice,redraw_note,redraw_prompt)
+        return
+    if action=="redraw":
+        if book.get("creation",{}).get("kind")!="text":
+            raise ValueError("只有文生绘本可以按故事设定重新绘制首帧。")
+        if not book["scenes"] or book.get("pending_source_pdf"):
+            from scene_pipeline import run
+            if not book["scenes"]:
+                original_story.outline(root,book)
+                save()
+            errors = run(root,book,book["scenes"],(),notice,frames_only=True)
+            if errors:
+                raise RuntimeError(" / ".join(errors))
+        elif book.get("visual_version")!=original_story.VISUAL_VERSION:
+            original_story.generate(root,book,notice,redraw=True)
+        save()
+        return
     if action=="build":
-        if book.get("creation",{}).get("kind")=="text":
-            original_story.generate(root,book,notice)
+        if not book["scenes"] and book.get("creation",{}).get("kind")=="text":
+            notice("DeepSeek 编写全书大纲与角色资料")
+            original_story.outline(root,book)
             save()
         elif not book["scenes"]:
             make(root,book,"analyze","","",notice)
         try:
             make(root,book,"all","","",notice)
         except (ValueError, RuntimeError):
-            if all(s.get("script") and set(languages(book)) <= s.get("audio",{}).keys() for s in book["scenes"]):
+            if book.get("activities") and all(s.get("frame") and s.get("script") and
+                    (not s.get("clean_review") or s.get("clean_approved")) and
+                    set(languages(book)) <= s.get("audio",{}).keys() for s in book["scenes"]):
                 try:
                     make(root,book,"proof","","",notice)
                 except (ValueError, RuntimeError, OSError):
@@ -348,14 +437,15 @@ def make(root,book,action,sid,lang,notice):
         scene = next((s for s in book["scenes"] if s["id"]==sid),None)
         if not scene:
             raise ValueError("请先选择要重新制作的分镜。")
-        for step in ("clean","script","voice"):
-            make(root,book,step,sid,"",notice)
         if scene.get("video"):
-            for key in ("video","video_seconds","video_source","task"):
+            for key in ("video","video_seconds","video_source","task","planned_video_seconds"):
                 scene.pop(key,None)
             scene["animation_revision"] = uuid.uuid4().hex
             save()
-        make(root,book,"video",sid,"",notice)
+        from scene_pipeline import run
+        errors = run(root,book,[scene],languages(book),notice)
+        if errors:
+            raise RuntimeError(" / ".join(errors))
         if any(not s.get("script") or not set(languages(book)) <= s.get("audio",{}).keys() for s in book["scenes"]):
             make(root,book,"export",sid,"",notice)
         else:
@@ -381,9 +471,16 @@ def make(root,book,action,sid,lang,notice):
         raise ValueError("此作品未选择该配音语言。")
     langs = (lang,) if lang else enabled
     if action in {"all","sample"}:
-        steps = ["clean","script"] + ([] if action=="sample" else ["activities"]) + ["voice","video","export"]
-    else:
-        steps = [action]
+        from scene_pipeline import run
+        errors = run(root,book,scenes,langs,notice)
+        if action=="all" and all(s.get("script") for s in book["scenes"]):
+            make(root,book,"activities","","",notice)
+            faq_speech(root,book,langs,notice,save)
+        if errors:
+            raise RuntimeError(" / ".join(dict.fromkeys(errors)))
+        make(root,book,"export",sid,"",notice)
+        return
+    steps = [action]
     for step in steps:
         if step=="activities":
             if any(not s.get("script") for s in book["scenes"]):
@@ -427,7 +524,9 @@ def make(root,book,action,sid,lang,notice):
                 if not s.get("frame"):
                     raise ValueError(f"请先清理「{s['title']}」的首帧。")
                 if not s.get("script"):
-                    s["script"]=ed.draft(root,book,book["scenes"].index(s))
+                    s["script"] = ed.locate_spots(root,book,s) if s.get("cue_plan") else ed.draft(root,book,book["scenes"].index(s))
+                    s.pop("cue_plan",None)
+                    instructions.stamp(s,book,"tts","image2video","interaction")
             elif step=="voice":
                 if not s.get("script"):
                     raise ValueError(f"请先生成「{s['title']}」的制作稿。")
@@ -436,10 +535,12 @@ def make(root,book,action,sid,lang,notice):
                         synthesize(root,book,s,l,notice)
                         save()
             elif step=="video":
-                if any(l not in s.get("audio",{}) for l in enabled):
-                    raise ValueError("请先合成配音，以确定镜头时长。")
+                if not s.get("frame") or not s.get("script"):
+                    raise ValueError("请先完成本幕首帧和动作提示。")
                 if s.get("clean_review") and not s.get("clean_approved"):
                     raise ValueError(f"请先在清图对照中核对「{s['title']}」的残留标记。")
+                if motion.pin_duration(s,enabled):
+                    save()
                 motion.animate(root,s,book.get("video_provider","heygen"),notice,save)
             else:
                 raise ValueError("未知的制作步骤。")

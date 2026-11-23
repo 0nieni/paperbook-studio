@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import tempfile
 from threading import Lock, Thread
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -22,9 +23,12 @@ import editing
 import production
 import motion
 import providers
+import reader_questions
+from rsi import evidence
+from rsi.service import StudioRSI
 
 HOME = Path(__file__).resolve().parent
-ACTIONS = {"import","analyze","clean","reclean","script","activities","voice","video","sample","all","export","proof","reel","build","refresh_scene"}
+ACTIONS = {"import","analyze","clean","reclean","script","activities","voice","video","sample","all","export","proof","reel","build","redraw","redraw_scene","refresh_scene"}
 
 
 class Studio:
@@ -32,7 +36,9 @@ class Studio:
         self.data=data.resolve()
         data.mkdir(exist_ok=True,parents=True)
         self.guard=Lock()
+        self.job_files=Lock()
         self.working=set()
+        self.rsi=StudioRSI(self.data)
         for project in data.iterdir():
             if project.is_dir() and (project/"project.json").is_file() and self.job(project)["state"]=="running":
                 self.status(project,"interrupted",self.job(project).get("stage",""),"服务已重启。重新执行该步骤可沿用缓存和已有视频任务。")
@@ -47,10 +53,12 @@ class Studio:
 
     def job(self,root):
         path=root/"job.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"state":"idle","stage":"","message":"就绪"}
+        with self.job_files:
+            return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"state":"idle","stage":"","message":"就绪"}
 
     def status(self,root,state,stage,message):
-        providers.save_json(root/"job.json",{"state":state,"stage":stage,"message":message})
+        with self.job_files:
+            providers.save_json(root/"job.json",{"state":state,"stage":stage,"message":message})
 
     def start(self,root,body):
         action=body.get("action")
@@ -65,25 +73,52 @@ class Studio:
             sid=body.get("scene","")
             if sid and sid not in {s["id"] for s in book["scenes"]}:
                 raise ValueError("场景不存在。")
-            if action in {"sample","refresh_scene"} and not sid:
+            if action in {"sample","refresh_scene","redraw_scene"} and not sid:
                 raise ValueError("请先选择要制作的分镜。")
-            if sid and action in {"all","build"}:
+            options = {}
+            if action=="redraw_scene":
+                note=body.get("redraw_note","")
+                if not isinstance(note,str) or len(note)>1000:
+                    raise ValueError("重画要求请控制在 1000 字内。")
+                options["redraw_note"]=note.strip()
+                prompt=body.get("redraw_prompt")
+                if prompt is not None and (not isinstance(prompt,str) or not prompt.strip() or len(prompt)>20000):
+                    raise ValueError("请填写本幕插画提示词，最多 20000 字。")
+                options["redraw_prompt"]=prompt.strip() if prompt is not None else None
+            if sid and action in {"all","build","redraw"}:
                 raise ValueError("整书生成请使用全书范围。")
             if action=="refresh_scene" and body.get("use_minimax") is True:
                 book["video_provider"] = "minimax"
                 production.write(root,book)
+            if action not in {"import","export","proof","reel"} and not book.get("rsi_prompts"):
+                self.rsi.select(book)
+                production.write(root,book)
+            edition_fields = ("edition","play_edition","proof_edition","sample_edition")
+            previous = {(book.get(k) or {}).get("id") for k in edition_fields}
             self.working.add(root)
             self.status(root,"running",action,"正在开始")
         def worker():
             try:
                 production.make(root,book,action,sid,body.get("language",""),
-                                lambda text:self.status(root,"running",action,text))
+                                lambda text:self.status(root,"running",action,text),**options)
+                if action=="redraw_scene":
+                    self.rsi.enqueue_redraw(root,book,next(s for s in book["scenes"] if s["id"]==sid))
                 self.status(root,"done",action,"本步骤已完成")
             except Exception as e:
                 self.status(root,"error",action,str(e) or type(e).__name__)
             finally:
-                with self.guard:
-                    self.working.discard(root)
+                try:
+                    editions = {book[k]["id"] for k in edition_fields if book.get(k)}
+                    for edition in editions-previous:
+                        self.rsi.enqueue(root,edition,self.reviews(root))
+                    completed = self.job(root)["state"]=="done"
+                    if book["scenes"] and not editions-previous and (
+                            completed and action in {"analyze","redraw","clean","reclean","script","activities","voice","video"}
+                            or action in {"build","refresh_scene","all","sample"} and not completed):
+                        self.rsi.enqueue(root,draft=evidence.snapshot(root,book))
+                finally:
+                    with self.guard:
+                        self.working.discard(root)
         Thread(target=worker,daemon=True).start()
 
     def view(self,root):
@@ -110,7 +145,9 @@ class Studio:
             raise ValueError("这份绘本版本暂时无法评价，请刷新首页。")
         entry = {"rating":rating,"notes":notes.strip(),"edition":version,"created":datetime.now(timezone.utc).isoformat()}
         with self.guard:
-            providers.save_json(root/"reviews.json", [entry,*self.reviews(root)])
+            reviews = [entry,*self.reviews(root)]
+            providers.save_json(root/"reviews.json", reviews)
+            self.rsi.enqueue(root,version,reviews)
         return entry
 
     def playable(self,root,book):
@@ -138,6 +175,14 @@ class Studio:
             if edition and (root/"editions"/edition["id"]/"index.html").is_file():
                 return edition
         return None
+
+
+class LocalServer(ThreadingHTTPServer):
+    def server_bind(self):
+        if os.name=="nt":
+            self.allow_reuse_address=False
+            self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
+        super().server_bind()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -323,6 +368,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.data(app.view(root),head=head)
                 if parts[3:]==["job"]:
                     return self.data(app.job(root),head=head)
+                if parts[3:]==["rsi"]:
+                    return self.data(app.rsi.view(root),head=head)
                 if len(parts)==5 and parts[3]=="original":
                     book=production.read(root)
                     s=next((s for s in book["scenes"] if s["id"]==parts[4]),None)
@@ -343,6 +390,9 @@ class Handler(BaseHTTPRequestHandler):
                         return self.file(root/"editions"/parts[3],book["profile"]["title"]+suffix,head)
                     if len(parts) in {5,6} and re.fullmatch(r"[0-9a-f]{24}",parts[3]):
                         sub=parts[4:]
+                        # Hosted editions share the current player; downloaded editions keep their bundled one.
+                        if sub == ["player.js"] and (root/"editions"/parts[3]/"book.js").is_file():
+                            return self.file(HOME/"reader"/"player.js",head=head)
                         if (len(sub)==1 and sub[0] in {"index.html","book.js","player.js","player.css","zh.srt","en.srt","zh.vtt","en.vtt","制作稿.json"}) or (len(sub)==2 and sub[0]=="assets" and re.fullmatch(r"[\w-]+\.(?:png|wav|mp4)",sub[1])):
                             return self.file(root/"editions"/parts[3]/Path(*sub),head=head)
             raise FileNotFoundError
@@ -356,8 +406,27 @@ class Handler(BaseHTTPRequestHandler):
             raise FileNotFoundError
         root=app.project(parts[2])
         body=self.json_body()
+        if method=="POST" and parts[3:]==["ask"]:
+            try:
+                return self.data(reader_questions.answer(root,body))
+            except RuntimeError as exc:
+                return self.data({"error":str(exc)},status=502)
         if method=="POST" and parts[3:]==["reviews"]:
             return self.data(app.add_review(root,body),status=201)
+        if method=="POST" and parts[3:]==["rsi"]:
+            if body.get("retry"):
+                app.rsi.retry(root,body["retry"])
+            elif body.get("edition"):
+                version=body["edition"]
+                if not isinstance(version,str) or not re.fullmatch(r"[0-9a-f]{24}",version) or not (root/"editions"/version/"book.js").is_file():
+                    raise ValueError("请选择这本书的播放版本。")
+                app.rsi.enqueue(root,version,app.reviews(root))
+            else:
+                with app.guard:
+                    if root in app.working:
+                        raise ValueError("本书正在制作，请等分镜保存后再评估。")
+                    app.rsi.enqueue(root,draft=evidence.snapshot(root,production.read(root)))
+            return self.data(app.rsi.view(root),status=202)
         if method=="POST" and parts[3:]==["jobs"]:
             app.start(root,body)
             return self.data(app.job(root),status=202)
@@ -404,7 +473,7 @@ def launch():
     a=p.parse_args()
     url=f"http://127.0.0.1:{a.port}/"
     try:
-        server=ThreadingHTTPServer(("127.0.0.1",a.port),Handler)
+        server=LocalServer(("127.0.0.1",a.port),Handler)
     except OSError:
         try:
             with build_opener(ProxyHandler({})).open(url+"api/health",timeout=2) as r:
@@ -425,6 +494,8 @@ def launch():
     except KeyboardInterrupt:
         pass
     finally:
+        server.studio.rsi.closed.set()
+        server.studio.rsi.signal.set()
         server.server_close()
 
 if __name__=="__main__":

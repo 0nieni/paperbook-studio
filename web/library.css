@@ -9,6 +9,16 @@
   --amber:#ffd48d;
   font-family:"DM Sans","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
 }
+.paper .redraw-frame{
+  position:absolute;
+  right:16px;
+  bottom:16px;
+  z-index:1;
+  padding:6px 13px;
+  line-height:1.5;
+  border:1px solid rgba(255,255,255,.75);
+  box-shadow:0 2px 6px #211d4638;
+}
 body{
   min-height:100vh;
   background:radial-gradient(ellipse at 75% 3%,#e5ddfb 0%,transparent 53%),var(--bg);
@@ -94,6 +104,7 @@ main{width:min(1160px,94%)}
 .feedback-panel{border:1px solid var(--line);border-radius:8px;padding:8px 12px}
 .review-entry{padding:9px 0;border-top:1px solid var(--line);margin-top:8px;overflow-wrap:anywhere}
 .review-entry p{white-space:pre-wrap}
+.scene-art-prompt{white-space:pre-line;margin-top:8px;color:var(--sub);overflow-wrap:anywhere}
 .review-entry .link{margin-top:6px}
 .studio-footer{
   display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
@@ -123,3 +134,7 @@ main{width:min(1160px,94%)}
   .workspace{padding:0 10px 12px}
 }
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+.rsi-controls{display:flex;gap:.6rem;flex-wrap:wrap;margin:.8rem 0}
+#rsi-results .review-entry{overflow-wrap:anywhere}
+#rsi-results details+details{margin-top:.65rem}
+#rsi-results summary{cursor:pointer}

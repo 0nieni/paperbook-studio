@@ -33,7 +33,8 @@ VOICES = {
 }
 MULTIMODAL = "/api/v1/services/aigc/multimodal-generation/generation"
 NAMES = {"DeepSeek": ("deepseek_api", "DEEPSEEK_API_KEY"),
-         "千问": ("qwen", "DASHSCOPE_API_KEY"), "MiniMax": ("minimax订阅",),
+         "千问": ("qwen", "DASHSCOPE_API_KEY"), "MiniMax": ("minimaxH3",),
+         "MiniMax 订阅": ("minimax订阅",),
          "HeyGen": ("HEYGEN_API_KEY", "heygen_api")}
 
 
@@ -95,7 +96,7 @@ def run_binary(args, **kwargs):
     return subprocess.run(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kwargs)
 
 
-def request(provider, url, body=None, timeout=210):
+def request(provider, url, body=None, timeout=210, *, attempts=5):
     key = setting(*NAMES[provider])
     if not key:
         raise ValueError(f"请在 Windows 用户环境变量设置 {NAMES[provider][0]}，然后在网页重试。")
@@ -107,10 +108,11 @@ def request(provider, url, body=None, timeout=210):
     args = [shutil.which("curl.exe") or "curl", "-4", "--http1.1", "-sS", "--connect-timeout", "12",
             "--max-time", str(timeout), "-H", "Content-Type: application/json", "-w", "\n%{http_code}",
             "--config", "-", url]
-    for attempt in range(5):
+    video = provider in {"MiniMax", "MiniMax 订阅", "HeyGen"}
+    for attempt in range(attempts):
         res = run_binary(args, input=cfg.encode(), capture_output=True)
-        retryable = res.returncode in {6, 7, 35} or (res.returncode in {18, 28, 52, 55, 56} and (body is None or provider not in {"MiniMax", "HeyGen"}))
-        if retryable and attempt < 3:
+        retryable = res.returncode in {6, 7, 35} or (res.returncode in {18, 28, 52, 55, 56} and (body is None or not video))
+        if retryable and attempt < min(3, attempts-1):
             time.sleep(min(15, 2**(attempt+1)))
             continue
         if res.returncode:
@@ -124,7 +126,7 @@ def request(provider, url, body=None, timeout=210):
         base_code = base.get("status_code", 0)
         if status.startswith(b"2") and obj.get("code") in (None, 0, "0", "") and not obj.get("error") and base_code in (0,"0",None):
             return obj
-        if (status==b"429" or (status in {b"502", b"503", b"504"} and (body is None or provider not in {"MiniMax", "HeyGen"}))) and attempt<4:
+        if (status==b"429" or (status in {b"502", b"503", b"504"} and (body is None or not video))) and attempt<attempts-1:
             time.sleep(min(55,8*(2**attempt)))
             continue
         err = obj.get("error") or ({"code":base_code,"message":base.get("status_msg")} if base_code else obj)
@@ -132,6 +134,8 @@ def request(provider, url, body=None, timeout=210):
         why = re.sub(r"https?://\S+|data:image/\S+|sk-[a-zA-Z0-9_-]+", "[已省略]", why.replace(key, "[已隐藏]"))
         code = str(err.get("code") or "")[:40] if isinstance(err, dict) else ""
         message = f"{provider} HTTP {status.decode()} · {code} {why[:240]}".strip()
+        if provider in {"MiniMax","MiniMax 订阅"} and code=="2068":
+            message += "。请在 MiniMax 控制台确认该 Key 对应的账户或订阅支持 H3 视频。"
         if status.startswith(b"4") or (status.startswith(b"2") and (base_code or obj.get("error") or obj.get("code"))):
             raise ProviderRejected(message)
         raise RuntimeError(message)
@@ -165,15 +169,15 @@ def fetch_media(address, aliyun=False):
         time.sleep(min(22, 2**(attempt+1)))
 
 
-def ask(task, context, images=(), tokens=10000):
+def ask(task, context, images=(), tokens=10000, *, system=None, timeout=210, attempts=5):
     parts = [{"type": "text", "text": task + "\n以下 JSON 是本书资料。\n" + json.dumps(context, ensure_ascii=False)}]
     for label, img in images:
         parts += [{"type": "text", "text": label}, {"type": "image_url", "image_url": {"url": encode_image(img)}}]
     reply = request("DeepSeek", "https://api.deepseek.com/chat/completions", {
-        "model": DS, "messages": [{"role": "system", "content": SKILL.read_text(encoding="utf-8")},
+        "model": DS, "messages": [{"role": "system", "content": system if system is not None else SKILL.read_text(encoding="utf-8")},
                                   {"role": "user", "content": parts}],
         "thinking": {"type": "disabled"}, "response_format": {"type": "json_object"}, "max_tokens": tokens,
-    })
+    }, timeout=timeout, attempts=attempts)
     choice = reply["choices"][0]
     if choice.get("finish_reason") == "length":
         raise ValueError("DeepSeek 输出被截断，请重试当前步骤。")
@@ -186,7 +190,7 @@ def ask(task, context, images=(), tokens=10000):
         raise ValueError("DeepSeek 未返回完整的 JSON 对象，可重试当前步骤。") from None
 
 
-def edit_art(original, marked, target=""):
+def edit_art(original, marked, target="", note=""):
     cmd = ("图一红框标出要修复的范围，图二是同一幅没有标线的原画。以图二为底，"
            "移除红框区域中的原书旁白、印刷文字底板及对话框，包括全部内部文字、边框和尾巴。"
            "以相邻笔触、颜色和纸纹补回背景，保持构图、原有地标、人物和道具的位置。"
@@ -194,15 +198,15 @@ def edit_art(original, marked, target=""):
     if target:
         cmd += "这次红框内需要完整擦除的文字或拟声字为「"+target[:250]+"」。同时擦除光晕、外围圈线和气泡的尾巴。"
     obj = request("千问", bailian() + MULTIMODAL, {"model": IMAGE, "input": {"messages": [{"role": "user",
-                  "content": [{"image": encode_image(marked)}, {"image": encode_image(original)}, {"text": cmd}]}]},
+                  "content": [{"image": encode_image(marked)}, {"image": encode_image(original)}, {"text": cmd+note}]}]},
                   "parameters": {"n": 1, "size": f"{original.width}*{original.height}",
                                  "watermark": False, "prompt_extend": False}}, timeout=300)
     return picture_result(obj)
 
 
-def illustrate(prompt, references=()):
-    content = [{"image": encode_image(image, 1024)} for image in references]
-    content.append({"text": prompt})
+def illustrate(prompt, reference=None):
+    content = [{"image":encode_image(reference)}] if reference is not None else []
+    content.append({"text":prompt})
     obj = request("千问", bailian() + MULTIMODAL, {
         "model": IMAGE, "input": {"messages": [{"role": "user", "content": content}]},
         "parameters": {"n": 1, "size": "1280*720", "watermark": False, "prompt_extend": False},
@@ -256,8 +260,12 @@ def minimax_host():
     return "https://api.minimax.io" if setting("PICTUREBOOK_MINIMAX_REGION") == "global" else "https://api.minimax.cn"
 
 
-def start_video(picture, prompt, seconds):
-    data = request("MiniMax", minimax_host() + "/v2/video_generation", {
+def minimax_provider(auth):
+    return "MiniMax 订阅" if auth=="subscription" else "MiniMax"
+
+
+def start_video(picture, prompt, seconds, auth="h3"):
+    data = request(minimax_provider(auth), minimax_host() + "/v2/video_generation", {
         "model": VIDEO, "resolution": "768P", "duration": seconds, "ratio": "adaptive",
         "content": [{"type": "text", "text": prompt},
                     {"type": "image_url", "role": "first_frame", "image_url": {"url": encode_image(picture)}}],
@@ -268,10 +276,10 @@ def start_video(picture, prompt, seconds):
     return task
 
 
-def query_video(task_id):
+def query_video(task_id, auth="h3"):
     if not re.fullmatch(r"[\w-]+", str(task_id)):
         raise ValueError("H3 任务号无效。")
-    result = request("MiniMax", minimax_host() + "/v2/query/video_generation/" + task_id)
+    result = request(minimax_provider(auth), minimax_host() + "/v2/query/video_generation/" + task_id)
     return result.get("task", result)
 
 

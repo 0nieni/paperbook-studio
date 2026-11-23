@@ -391,6 +391,27 @@ function renderSuggestions() {
   target.replaceChildren(...picks.map((item) => button(item.question, "chip", () => ask(item.question, item))));
 }
 
+const studioEdition = location.protocol === "http:" && ["localhost", "127.0.0.1"].includes(location.hostname)
+  && location.pathname.match(/^\/media\/([0-9a-f]{12})\/editions\/([0-9a-f]{24})\/index\.html$/);
+
+function presetAnswer(question) {
+  const normalize = text => text.toLowerCase().replace(/[\s\p{P}]+/gu, "");
+  const words = normalize(question);
+  if (!words) return null;
+  const exact = book.faq.find(item => normalize(item.question) === words);
+  if (exact) return exact;
+  const matches = book.faq.map(item => {
+    const terms = item.match.map(normalize).filter(token => token && words.includes(token));
+    const rest = terms.sort((a, b) => b.length - a.length).reduce((s, token) => s.replaceAll(token, ""), words);
+    return {item, score: words.length - rest.length};
+  }).sort((a, b) => b.score - a.score);
+  const best = matches[0];
+  if (!best?.score) return null;
+  // A shared word in a new question can refer to a different event.
+  if (studioEdition && (best.score !== words.length || matches[1]?.score === best.score)) return null;
+  return best.item;
+}
+
 function ask(question, known) {
   question = question.trim();
   if (!question) return;
@@ -399,22 +420,48 @@ function ask(question, known) {
   state.started = true;
   state.resume ||= {index: state.shot, time: narration.currentTime};
   tab("ask");
-  const matches = book.faq.map((item) => ({
-    item, score: item.match.reduce((sum, token) => sum + (question.toLocaleLowerCase().includes(token.toLocaleLowerCase()) ? token.length : 0), 0)
-  })).sort((a, b) => b.score - a.score);
-  const matched = known || book.faq.find((item) => question === item.question) || (matches[0]?.score ? matches[0].item : null);
-  rememberQuestion(question, matched?.evidence || [shots[state.shot].id]);
+  const matched = known || presetAnswer(question);
+  const scene = shots[state.shot].id;
+  rememberQuestion(question, matched?.evidence || [scene]);
   const chat = $("chat");
   chat.append(element("p", "from-child", question));
   if (matched) {
     chat.append(element("p", "from-book", matched.reply), evidenceItems(matched.evidence));
     speak(`faq-${matched.id}`);
+  } else if (studioEdition) {
+    const response = element("p", "from-book");
+    chat.append(response);
+    askDeepSeek(question, scene, response);
   } else {
-    chat.append(element("p", "from-book", tr("我会回答这本绘本里的问题。你可以说出一个角色或一件事，也可以试试下面的问题。","Try a question below, or ask about a character or event in this book.")));
+    chat.append(element("p", "from-book", tr("在本机制作台打开这本书，可以自由提问。离线阅读时可以点下面的问题，或输入随书关键词。","Open this book in the local studio to ask your own question. Offline, choose a question below or enter a book keyword.")));
   }
   chat.scrollTop = chat.scrollHeight;
   $("ask-input").value = "";
   renderControls();
+}
+
+async function askDeepSeek(question, scene, response) {
+  const language = locale;
+  response.textContent = tr("正在翻看这本书……", "Looking through the book…");
+  try {
+    const result = await fetch(`/api/projects/${studioEdition[1]}/ask`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({edition: studioEdition[2], language, scene, question})
+    });
+    const data = await result.json();
+    if (!result.ok) throw Error(data.error || tr("制作台暂时没有应答。", "The studio is unavailable."));
+    if (!response.isConnected) return;
+    response.textContent = data.reply;
+    if (data.evidence.length) {
+      response.after(evidenceItems(data.evidence));
+      rememberQuestion(question, data.evidence);
+    }
+  } catch (error) {
+    if (!response.isConnected) return;
+    response.textContent = tr("联网回答暂时不可用。", "Online answers are unavailable. ") + (error.message || "");
+    response.append(" ", button(tr("重试", "Try again"), "chip", () => askDeepSeek(question, scene, response)));
+  }
+  $("chat").scrollTop = $("chat").scrollHeight;
 }
 
 function rememberQuestion(question, evidence) {
@@ -678,7 +725,7 @@ const bookLabel = languages.length===2 ? tr("双语交互绘本","Bilingual pict
 document.title = edition.title+" · "+bookLabel;
 $("edition-note").textContent = edition.proof ? tr(`校对版 · ${generated.size} 幕动画，${shots.length-generated.size} 幕静帧`, `Review edition · ${generated.size} animated, ${shots.length-generated.size} still`) : edition.partial ? tr("动画样片","Animation sample") : bookLabel;
 $("quiz-top").hidden = !book.quiz.length;
-$("ask-tab").hidden = !book.faq.length;
+$("ask-tab").hidden = !book.faq.length && !studioEdition;
 $("voice-label").textContent=tr("配音","Audio");
 $("cc-label").textContent=tr("字幕","Subtitles");
 document.documentElement.lang = tr("zh-CN","en");

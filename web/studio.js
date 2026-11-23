@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const state = {book:null, tab:"layout", page:1, scene:"", part:0, region:"", tool:"select", dirty:false, timer:0, loading:false};
 const names = {narration:"旁白",dialogue:"对白",bubble:"气泡或文字底板（整体修补）",prop:"道具文字",mark:"出版标记",note:"教学或其他内容"};
-const stageNames = {import:"读取原页",analyze:"识别分镜",clean:"清理首帧",reclean:"重做清图",script:"编写制作稿",activities:"生成学习活动",voice:"合成配音",video:"生成逐幕动画",sample:"制作样片",all:"制作全书",export:"导出",proof:"导出校对版",reel:"导出动画样片",build:"自动制作整书",refresh_scene:"重新制作本幕"};
+const stageNames = {import:"读取原页",analyze:"识别分镜",clean:"清理首帧",reclean:"重做清图",script:"编写制作稿",activities:"生成学习活动",voice:"合成配音",video:"生成逐幕动画",sample:"制作样片",all:"制作全书",export:"导出",proof:"导出校对版",reel:"导出动画样片",build:"自动制作整书",redraw:"重画分镜首帧",refresh_scene:"重新制作本幕"};
 const node=(tag,cls="",text="")=>{const el=document.createElement(tag);if(cls)el.className=cls;if(text)el.textContent=text;return el;};
 function append(parent,...children){for(const c of children.flat())if(c)parent.append(c);return parent;}
 function action(text,fn,cls=""){const b=node("button",cls,text);b.type="button";b.onclick=()=>Promise.resolve().then(fn).catch(error=>message(error.message));return b;}
@@ -40,14 +40,45 @@ async function persist(){
  state.book=await req(api(),send("PUT",{revision:b.revision,profile:b.profile,regions:b.regions,scenes:b.scenes,tts_model:b.tts_model,video_provider:b.video_provider||"heygen"}));
  state.dirty=false;render();
 }
-async function job(type,scope="",lang="",useMinimax=false){
+async function job(type,scope="",lang="",useMinimax=false,options={}){
  if(busy())return;
- await persist();
- if(type==="analyze" && state.book.scenes.length && !confirm("重新识别会替换当前场景编辑。已导出的版本仍可从原链接打开。继续吗？"))return;
  state.loading=true;saveButton();
- try{state.book.job=await req(api()+"/jobs",send("POST",{action:type,scene:scope,language:lang,revision:state.book.revision,use_minimax:useMinimax}));status();poll(state.book.id);}
+ try{
+   await persist();
+   if(type==="analyze" && state.book.scenes.length && !confirm("重新识别会替换当前场景编辑。已导出的版本仍可从原链接打开。继续吗？"))return;
+   state.book.job=await req(api()+"/jobs",send("POST",{action:type,scene:scope,language:lang,revision:state.book.revision,use_minimax:useMinimax,...options}));status();poll(state.book.id);
+ }
  finally{state.loading=false;render();}
 }
+async function requestRedraw(scene){
+ const dialog=$("redraw-dialog"),form=$("redraw-form"),use=$("redraw-use-rsi");
+ const errorBox=$("redraw-error");errorBox.hidden=true;
+ const base=scene.art_prompt||scene.summary||scene.title;
+ form.elements.prompt.value=base;form.elements.note.value="";use.hidden=true;
+ $("redraw-scene").textContent=scene.title;dialog.showModal();
+ $("cancel-redraw").onclick=()=>dialog.close();
+ form.onsubmit=async e=>{
+   e.preventDefault();if(busy())return;
+   const prompt=form.elements.prompt.value.trim();
+   if(!prompt){form.elements.prompt.focus();return;}
+   const submit=form.querySelector('[type="submit"]');submit.disabled=true;
+   try{
+     state.sourceFor="";state.region="";state.tool="select";
+     await job("redraw_scene",scene.id,"",false,{redraw_prompt:prompt,redraw_note:form.elements.note.value.trim()});
+     dialog.close();
+   }catch(error){errorBox.textContent=error.message;errorBox.hidden=false;}
+   finally{submit.disabled=false;}
+ };
+ if(scene.redraw_edit){
+   const result=await req(api()+"/rsi");
+   const revision=result.events.map(e=>e.report?.redraw).find(r=>r?.id===scene.redraw_edit.id);
+   if(dialog.open && current()?.id===scene.id && revision?.suggestion){
+     use.onclick=()=>{form.elements.prompt.value=revision.suggestion;form.elements.prompt.focus();};
+     use.hidden=false;
+   }
+ }
+}
+stageNames.redraw_scene="重画分镜";
 function poll(id){clearTimeout(state.timer);state.timer=setTimeout(async()=>{
  if(state.book?.id!==id)return;
  try{const j=await req(projectUrl(id)+"/job");state.book.job=j;status();if(j.state==="running")poll(id);else{await loadBook(id);document.dispatchEvent(new Event("book-job-finished"));}}
@@ -94,9 +125,31 @@ function move(delta){const a=state.book.scenes,i=a.indexOf(current()),j=i+delta;
 function toolbarBtn(text,fn){const bt=action(text,fn,"mutating");bt.disabled=busy();return bt;}
 function layout(view){
  const b=state.book,s=current();const desk=node("div","desk"),left=node("section","panel"),right=node("aside","panel");
- const pages=select(b.pages.map(p=>[p.n,"第 "+p.n+" 页"]),state.page,v=>{state.page=+v;state.region="";render();},"原页");
- append(left,head("原页",pages));const bed=node("div","canvas-bed"),paper=node("div","paper"),img=node("img");img.src=pageImage(state.page);img.alt="绘本原稿第 "+state.page+" 页";
- const over=node("div","overlay");append(bed,append(paper,img,over));left.append(bed);
+ const pages=select(b.pages.map(p=>[p.n,"第 "+p.n+" 页"]),state.page,v=>{
+   state.page=+v;state.region="";
+   if(state.tool==="select"){
+     const target=s?.parts.some(p=>p.page===state.page)?s:b.scenes.find(sc=>sc.parts.some(p=>p.page===state.page));
+     if(target){state.scene=target.id;state.part=target.parts.findIndex(p=>p.page===state.page);}
+   }
+   render();
+ },"原页");
+ const onPage=s?.parts.some(p=>p.page===state.page);
+ const previewKey=onPage && s.frame && s.frame===s.redrawn_frame ? b.id+"/"+s.id+"/"+s.frame : "";
+ const preview=!!previewKey && state.sourceFor!==previewKey && !state.region && state.tool==="select";
+ const toggle=previewKey?action(preview?"查看原页":"查看重画结果",()=>{
+   state.sourceFor=preview?previewKey:"";state.tool="select";state.region="";render();
+ }):null;
+ append(left,head(preview?"分镜画面":"原页",toggle,pages));
+ const bed=node("div","canvas-bed"),paper=node("div","paper"),img=node("img");
+ img.src=preview?media("assets",s.frame):pageImage(state.page);
+ img.alt=preview?"重画分镜 · "+s.title:"绘本原稿第 "+state.page+" 页";
+ const over=node("div","overlay");over.hidden=preview;append(bed,append(paper,img,over));left.append(bed);
+ if(onPage && !s.needs_illustration){
+   const redraw=action("重画分镜",()=>requestRedraw(s),"primary redraw-frame");
+   redraw.disabled=busy();redraw.title="用千问重画「"+s.title+"」的首帧";
+   redraw.onpointerdown=e=>e.stopPropagation();
+   paper.append(redraw);
+ }
  function drawBox(bx,cls,caption=""){const el=node("div","box "+cls);el.style.left=100*bx[0]+"%";el.style.top=100*bx[1]+"%";el.style.width=100*(bx[2]-bx[0])+"%";el.style.height=100*(bx[3]-bx[1])+"%";
  if(caption)el.append(node("b","",caption));over.append(el);return el;}
  let activeBox;
@@ -107,7 +160,7 @@ function layout(view){
  function pos(e){const r=paper.getBoundingClientRect();return [Math.max(0,Math.min(1,(e.clientX-r.left)/r.width)),Math.max(0,Math.min(1,(e.clientY-r.top)/r.height))];}
  let drag=null;
  paper.onpointerdown=e=>{
- if(busy()||e.button!==0)return;
+ if(preview||busy()||e.button!==0)return;
  const [x,y]=pos(e),r=b.regions.find(a=>a.id===state.region),part=s?.parts[state.part];
  const target=r&&r.page===state.page?r:part?.page===state.page?part:null;
  let mode=state.tool,entry=target;
@@ -131,14 +184,18 @@ function layout(view){
  else if(d.entry)d.entry.box=d.now;
  state.tool="select";mark();};
  const tools=node("div","toolbar");for(const [key,name] of [["select","移动 / 改大小"],["crop","框选本幕"],["extend","添加跨页画面"],["region","框选文字"],["words","显示文字框"]]){
- const bt=toolbarBtn(name,()=>{state.tool=key;if(["crop","extend"].includes(key))state.region="";render();});bt.setAttribute("aria-pressed",state.tool===key);tools.append(bt);}
- append(left,tools,node("p","hint",state.tool==="extend"?"切到相邻页，拖出要拼入本幕的原画范围。":state.tool==="select"?"拖动选区移动位置，拖右下角调整大小。":"在原页上按住并拖出矩形。"));
+ const bt=toolbarBtn(name,()=>{state.sourceFor=previewKey;state.tool=key;if(["crop","extend"].includes(key))state.region="";render();});bt.setAttribute("aria-pressed",!preview&&state.tool===key);tools.append(bt);}
+ append(left,tools,node("p","hint",preview?"当前显示本幕重画后的首帧。":state.tool==="extend"?"切到相邻页，拖出要拼入本幕的原画范围。":state.tool==="select"?"拖动选区移动位置，拖右下角调整大小。":"在原页上按住并拖出矩形。"));
  const layout=b.layouts.find(p=>p.page===state.page);if(layout?.reason)left.append(node("p","hint",layout.reason));
  append(right,head("故事分镜",b.creation?.kind==="text"?null:jobButton(b.scenes.length?"重新识别":"识别全书分镜","analyze")));
  const rail=node("ol","rail");b.scenes.forEach((sc,i)=>{const bt=action("",()=>pickScene(sc));append(bt,node("strong","",sc.title),node("small","","p. "+sc.parts.map(p=>p.page).join(" + ")));
  const li=append(node("li",sc===s?"current":""),node("span","",String(i+1).padStart(2,"0")),bt);rail.append(li);});right.append(rail);
  append(right,append(node("div","toolbar"),toolbarBtn("添加场景",addScene),toolbarBtn("拆成两幕",splitScene),toolbarBtn("与下一幕拼接",mergeScene),toolbarBtn("上移",()=>move(-1)),toolbarBtn("下移",()=>move(1))));
+ if(b.creation?.kind==="text"&&!b.visual_version){
+  const redraw=action("重画分镜首帧",()=>job("redraw"),"mutating");redraw.disabled=busy();right.append(redraw);
+ }
  if(s){append(right,field("场景名",s.title,v=>s.title=v),field("这一幕发生的事",s.summary,v=>s.summary=v,true));
+ if(s.art_prompt)right.append(append(node("details"),node("summary","","本幕插画提示词"),node("p","scene-art-prompt",s.art_prompt)));
  const regenerate=action(s.video?"重新生成本幕视频":s.task?.state==="pending"?"继续生成本幕视频":"生成本幕视频",()=>{
    if(!s.video || confirm("为这一幕生成一段新的 MiniMax H3 动画？"))return job("refresh_scene",s.id,"",true);
  },"primary mutating");regenerate.disabled=busy();append(right,append(node("div","actions"),regenerate));
@@ -200,7 +257,7 @@ function scripts(view){
 function output(view){
  const b=state.book,s=current(),sec=node("section","editor");append(sec,head("生成素材",s?selectScene():null));
  if(!s){sec.append(node("p","hint","请先建立场景清单。"));view.append(sec);return;}
- append(sec,node("p","muted","样片处理当前一幕。整书制作沿用已有素材，按清图、制作稿、学习活动、双语语音、动画和打包顺序运行。"),
+ append(sec,node("p","muted","各幕并行制作。完成后可打开互动播放器，或下载整本绘本包。"),
  append(node("div","actions"),jobButton("制作当前幕样片","sample",s.id,"primary"),jobButton("制作全书（"+b.scenes.length+" 幕）","all"),jobButton("导出当前校对版","proof"),jobButton("导出已完成动画","reel")));
  if(b.creation&&["error","interrupted"].includes(b.job.state))sec.append(jobButton("继续自动制作整本","build"));
  const provider=b.video_provider||"heygen";
@@ -208,11 +265,11 @@ function output(view){
  sec.append(append(node("label","field"),"后续动画服务",engine));
  if(provider==="heygen" && s.frame && s.script){
    const exchange=node("section","editor");exchange.append(head("用 HeyGen 制作本幕"));
-   const seconds=Math.min(30,Math.max(5,Math.ceil(Math.max(s.audio?.zh?.duration||0,s.audio?.en?.duration||0))));
+   const seconds=Math.min(30,Math.max(5,Math.ceil(s.planned_video_seconds||Math.max(s.audio?.zh?.duration||0,s.audio?.en?.duration||0))));
    exchange.append(node("p","hint",`本幕建议 ${seconds} 秒。可从本机网页用 HeyGen API 生成，也可在 HeyGen 选择图生视频，使用这张首帧和动作提示，再导入成片。`));
    const tools=append(node("div","actions"),link("下载本幕首帧",media("assets",s.frame),true),action("复制动作提示",async()=>{await navigator.clipboard.writeText(s.script.video_prompt);message("已复制本幕提示词");}),link("打开 HeyGen","https://app.heygen.com/"));
    if(!s.video){
-     if((b.languages||["zh","en"]).every(l=>s.audio?.[l]))tools.append(jobButton("生成本幕动画","video",s.id));
+     tools.append(jobButton("生成本幕动画","video",s.id));
      const upload=node("input");upload.type="file";upload.accept="video/mp4,.mp4";upload.hidden=true;
      upload.onchange=async()=>{const file=upload.files[0];if(!file)return;try{await persist();const revision=state.book.revision;state.loading=true;render();const q=new URLSearchParams({revision});await req(projectUrl(b.id)+"/clips/"+encodeURIComponent(s.id)+"?"+q,{method:"POST",headers:{"Content-Type":"video/mp4"},body:file});await loadBook(b.id);message("已接入本幕动画，可重新导出整书。");}catch(err){message(err.message);}finally{state.loading=false;render();}};
      tools.append(action("导入本幕 MP4",()=>upload.click(),"mutating"),upload);

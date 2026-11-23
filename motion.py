@@ -19,9 +19,32 @@ def directory_record(root, service, key):
     return root / "cache" / (prefix + "-" + key + ".json")
 
 
+def estimate_seconds(script, languages):
+    lengths = []
+    for lang in languages:
+        lines = [line[lang] for line in script["lines"]]
+        if lang == "zh":
+            spoken = sum(len(re.sub(r"[^\w]", "", line)) for line in lines) / 3.5
+        else:
+            spoken = sum(len(line.split()) for line in lines) / 2.2
+        lengths.append(spoken + .22 * len(lines))
+    return math.ceil(max(lengths))
+
+
+def pin_duration(scene, languages):
+    if scene.get("planned_video_seconds"):
+        return False
+    if all(lang in scene.get("audio",{}) for lang in languages):
+        seconds = math.ceil(max(track["duration"] for track in scene["audio"].values()))
+    else:
+        seconds = estimate_seconds(scene.get("script") or scene["cue_plan"],languages)
+    scene["planned_video_seconds"] = seconds
+    return True
+
+
 def frame_recipe(scene, service):
     low, high = (5, 30) if service == "heygen" else (4, 15)
-    measured = max(track["duration"] for track in scene["audio"].values())
+    measured = scene.get("planned_video_seconds") or max(track["duration"] for track in scene["audio"].values())
     seconds = min(high, max(low, math.ceil(measured)))
     prompt = scene["script"]["video_prompt"] + f"\nSingle continuous shot, {seconds} seconds. Hold the final composition. Silent; no new lettering, captions or speech balloons."
     return seconds, prompt
@@ -98,10 +121,20 @@ def animate(root, scene, service, notify, save):
         raise ValueError("本幕在另一家平台有待处理任务。请先核对原任务或导入已完成的 MP4。")
     model, label = MODELS[service], LABELS[service]
     key, seconds, prompt = render_recipe(scene, service)
+    if old.get("state") in {"pending","submitting"} and old.get("key") and old["key"] != key:
+        raise ValueError(f"{label} 已有本幕的待处理任务。请核对原任务和首帧后再提交。")
     path = directory_record(root, service, key)
     journal = json.loads(path.read_bytes()) if path.exists() else {}
+    auth = None
+    if service=="minimax":
+        if journal.get("state") in {"submitting","pending","succeeded"}:
+            auth = journal.get("auth","subscription")
+        else:
+            auth = "h3"
     def checkpoint(state, **fields):
         record = {"provider":service, "key":key, "state":state, **fields}
+        if auth:
+            record["auth"] = auth
         api.save_json(path, record)
         scene["task"] = record
         save()
@@ -122,17 +155,15 @@ def animate(root, scene, service, notify, save):
         checkpoint("submitting", id="")
         try:
             with Image.open(root / "assets" / scene["frame"]) as picture:
-                start = api.start_heygen if service == "heygen" else api.start_video
-                task = start(picture, prompt, seconds)
+                task = api.start_heygen(picture,prompt,seconds) if service=="heygen" else api.start_video(picture,prompt,seconds,auth)
         except Exception as error:
             if isinstance(error, api.ProviderRejected) or re.search(r"curl (6|7|35)\b|用户环境变量", str(error)):
                 checkpoint("failed", id="", message=str(error)[:280])
             raise
     checkpoint("pending", id=task)
-    query = api.query_heygen if service == "heygen" else api.query_video
     deadline = time.monotonic() + 45*60
     while time.monotonic() < deadline:
-        result = query(task)
+        result = api.query_heygen(task) if service=="heygen" else api.query_video(task,auth)
         status = result.get("status")
         notify(f"{scene['title']} · {label} {status} · {task}")
         if status in {"failed", "cancelled", "canceled"}:

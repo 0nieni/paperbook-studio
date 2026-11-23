@@ -116,9 +116,75 @@ async function openEditor(id){
   await persist();
   await loadBook(id);
   renderFeedback();
+  $("rsi-results").replaceChildren();
+  if($("rsi-panel").open)refreshRSI().catch(e=>message(e.message));
   $("workspace").hidden=false;
   $("workspace").scrollIntoView({behavior:"instant",block:"start"});
 }
+
+const rsiStates={queued:"等待评估",running:"模型评估中",done:"已完成",error:"评估失败"};
+const rsiDimensions={story:"故事与分镜",picture:"画面",speech:"朗读",motion:"动画导演稿",learning:"互动学习"};
+let rsiTimer, rsiRequest=0;
+async function refreshRSI(){
+  clearTimeout(rsiTimer);
+  const book=state.book, seq=++rsiRequest;
+  if(!book || !$("rsi-panel").open)return;
+  const result=await req(projectUrl(book.id)+"/rsi");
+  if(book.id!==state.book?.id || seq!==rsiRequest || !$("rsi-panel").open)return;
+  $("rsi-edition").disabled=!book.published;
+  $("rsi-draft").disabled=!book.scenes.length || busy();
+  const box=$("rsi-results");
+  const expanded=new Set([...box.querySelectorAll("details[open]")].map(el=>el.dataset.record));
+  box.replaceChildren();
+  if(result.policies.length){
+    const group=append(node("details","review-entry"),node("summary","","同类绘本正在使用的改动"));
+    group.dataset.record="policies";group.open=expanded.has("policies");
+    for(const p of result.policies)append(group,node("p","",p.role+" · "+(p.status==="active"?"已采用":"试用中")+" · "+p.id),node("p","",p.text));
+    box.append(group);
+  }
+  if(!result.events.length)box.append(node("p","hint","下次生成或保存评价后会自动复盘。也可以先选一个版本评估。"));
+  for(const row of result.events){
+    const title=row.source+" · "+rsiStates[row.state]+" · "+new Date(row.created*1000).toLocaleString("zh-CN");
+    const item=append(node("details","review-entry"),node("summary","",title));
+    item.dataset.record=row.id;item.open=expanded.has(row.id);
+    if(row.edition)item.append(link("播放被评版本",editionUrl(book,row.edition)));
+    if(row.error)append(item,node("p","",row.error),action("重试这次评估",()=>submitRSI({retry:row.id})));
+    const report=row.report;
+    if(report){
+      item.append(node("p","",report.scenes+" 幕 · 千问看图 "+report.vision+" 幕 · 家长评价 "+report.reviews+" 条 · 综合 "+Math.round(report.overall*100)+" / 100"));
+      if(report.warning)item.append(node("p","hint",report.warning));
+      const edit=report.redraw;
+      if(edit){
+        item.append(node("strong","","第 "+edit.position+" 幕 · "+edit.title),
+          node("p","","原提示词："+edit.before),node("p","","提交的提示词："+edit.after));
+        if(edit.suggestion)item.append(node("p","","RSI 修订稿："+edit.suggestion),node("p","hint",edit.reason));
+      }
+      for(const [key,d] of Object.entries(report.dimensions)){
+        append(item,node("strong","",rsiDimensions[key]+" · "+Math.round(d.score*100)+" / 100"),
+          node("p","",d.pages.map(i=>"第 "+(edit?edit.position:i)+" 幕").join("、")+" · "+d.critique));
+      }
+      for(const a of report.actions)item.append(node("p","",a));
+      if(report.trial){
+        const t=report.trial;
+        item.append(node("p","","对比分镜 "+t.scene+" · "+t.role),node("p","","原指引："+t.before),
+          node("p","","候选补充："+t.after),node("p","","盲评依据："+t.reason));
+      }
+    }
+    box.append(item);
+  }
+  if(result.events.some(e=>["queued","running"].includes(e.state))){
+    rsiTimer=setTimeout(()=>refreshRSI().catch(e=>message(e.message)),3500);
+  }
+}
+async function submitRSI(body){
+  const id=state.book.id;
+  if(!body.edition && !body.retry)await persist();
+  await req(projectUrl(id)+"/rsi",send("POST",body));
+  await refreshRSI();
+}
+$("rsi-panel").ontoggle=()=>refreshRSI().catch(e=>message(e.message));
+$("rsi-edition").onclick=()=>submitRSI({edition:state.book.published.id}).catch(e=>message(e.message));
+$("rsi-draft").onclick=()=>submitRSI({}).catch(e=>message(e.message));
 
 function renderPreview(type) {
   const pane=$(type+"-preview");
@@ -233,13 +299,14 @@ $("rating-form").onsubmit=async e=>{
   try{
     const entry=await req(projectUrl(book.id)+"/reviews",send("POST",{rating:Number(data.get("rating")),notes:data.get("notes"),edition:book.edition.id}));
     if(state.book?.id===book.id){state.book.reviews=[entry,...(state.book.reviews||[])];renderFeedback();}
+    if(state.book?.id===book.id && $("rsi-panel").open)refreshRSI().catch(e=>message(e.message));
     $("rating-dialog").close();message("评价已保存到这本绘本的资料。");
   }catch(error){message(error.message);}finally{submit.disabled=false;}
 };
-$("close-editor").onclick=async()=>{try{await persist();$("workspace").hidden=true;}catch(error){message(error.message);}};
+$("close-editor").onclick=async()=>{try{await persist();$("rsi-panel").open=false;$("workspace").hidden=true;}catch(error){message(error.message);}};
 window.addEventListener("hashchange",showPage);
 window.addEventListener("storage",renderFeedback);
-document.addEventListener("book-job-finished",()=>{renderFeedback();refresh().catch(e=>message(e.message));});
+document.addEventListener("book-job-finished",()=>{renderFeedback();refresh().catch(e=>message(e.message));refreshRSI().catch(e=>message(e.message));});
 showPage();
 req("/api/health").then(info=>{
   tones=info.voices;

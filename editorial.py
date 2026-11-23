@@ -1,4 +1,5 @@
 """Structured editorial tasks. Scene and source IDs are assigned by the host."""
+import hashlib
 import json
 import re
 
@@ -6,6 +7,7 @@ from PIL import Image
 
 import artwork as art
 import providers as api
+from rsi import instructions
 
 PAGE_TASK = """阅读当前页，前后页仅作判断接缝和阅读顺序的参考。输出 JSON 对象：
 {"direction":"ltr或rtl","skip_reason":"故事页留空，封面/扉页/版权等说明原因","panels":[{"title":"简短中文标题","summary":"可见事件","box":[左,上,右,下],"join_previous":0}],"regions":[{"text":"准确转录，可包含多行","speaker":"旁白或角色名","kind":"narration/dialogue/bubble/prop/mark/note","box":[左,上,右,下],"panel":1}]}。
@@ -79,7 +81,7 @@ def cached_ask(root, task, context, images, source_key, validate, tokens):
     return normalized
 
 
-def read_page(root, pages, n, previous):
+def read_page(root, pages, n, previous, book=None):
     context = {"page": n, "total": len(pages), "previous_panels": previous.get("panels", []),
                "文字层": pages[n-1]["text"][:18000]}
     images = []
@@ -89,7 +91,7 @@ def read_page(root, pages, n, previous):
             if k != n:
                 p.thumbnail((760,760))
             images.append((f"PDF 第 {k} 页" + ("，当前要处理的页" if k==n else "，相邻参考页"),p))
-    layout = cached_ask(root,PAGE_TASK,context,images,n,lambda r:normalize_layout(n,r),11000)
+    layout = cached_ask(root,instructions.apply(PAGE_TASK,book or {},"story"),context,images,n,lambda r:normalize_layout(n,r),11000)
     reconcile_text(layout, pages[n-1]["objects"])
     return layout
 
@@ -297,21 +299,52 @@ def scene_brief(scene):
     return {k:scene[k] for k in ("id","title","summary","parts","sources")}
 
 
-def draft(root, book, i):
+def draft(root, book, i, before_frame=False):
     scenes, s = book["scenes"], book["scenes"][i]
     context = {"资料卡":book["profile"],"前一幕":scenes[i-1]["summary"] if i else "",
                "后一幕":scenes[i+1]["summary"] if i+1<len(scenes) else "",
                "当前场景":scene_brief(s),"逐句原文":[r for r in book["regions"] if r["id"] in s["sources"]]}
     images = []
-    for field, title in (("original","原图"),("frame","清理后的横屏首帧，标注热点请用此图")):
-        with Image.open(root/"assets"/s[field]) as im:
-            images.append((title,im.convert("RGB")))
     task = SCRIPT_TASK
+    if before_frame:
+        original,_,_ = art.compose(root,s,[])
+        images.append(("按本幕裁切、拼接的原画，尺寸与最终首帧一致",original))
+        signature = ["pre-clean",hashlib.sha256(art.image_bytes(original)).hexdigest(),s["parts"]]
+        task += ("\n此步骤先看已拼接的原画，根据原句和画面写朗读与动作。额外返回 clean_instruction 字符串，"
+                 "用一两句话交代本幕待清除的印字及附近须保留的人物、道具、轮廓和背景。热点将在清图后复核。")
+    else:
+        for field, title in (("original","原图"),("frame","清理后的横屏首帧，标注热点请用此图")):
+            with Image.open(root/"assets"/s[field]) as im:
+                images.append((title,im.convert("RGB")))
+        signature = [s["frame"],s["original"]]
     if book.get("creation",{}).get("kind") == "text":
         context["原创故事设定"] = book["creation"]["brief"]
         context["本幕原创台词草稿"] = s.get("story_lines",[])
-        task += "\n本书为原创插画，画面上未印台词。结合本幕情节与台词草稿编写双语朗读，sources 填空数组。用真实可见的物品讲解教学目标。"
-    return cached_ask(root,task,context,images,[s["frame"],s["original"]],lambda o:validate_script(o,s),8500)
+        context["本幕画面设计"] = s.get("visual",{})
+        task += "\n本书为原创插画，画面上未印台词。结合本幕情节与台词草稿编写双语朗读，sources 填空数组。用真实可见的物品讲解教学目标。首帧动画仅使用本幕已经出现的环境、角色与道具，写明哪个角色或物品如何移动及结束位置，不借用相邻幕画面。"
+    if s.get("redraw_lines"):
+        context["已确认的逐句台词与朗读指令"] = s["redraw_lines"]
+        task += "\n沿用已确认的逐句台词，根据新首帧重新编排动作提示并定位互动道具。"
+    task = instructions.apply(task,book,"tts","image2video","interaction")
+    def validate(raw):
+        if s.get("redraw_lines"):
+            raw = {**raw,"lines":s["redraw_lines"]}
+        script = validate_script(raw,s)
+        if before_frame:
+            return {"cue_plan":script,"clean_instruction":label(raw.get("clean_instruction"),"本幕清图指令")}
+        return script
+    return cached_ask(root,task,context,images,signature,validate,8500)
+
+
+def locate_spots(root, book, scene):
+    script = scene["cue_plan"]
+    task = """查看最终横屏首帧，定位草稿里实际可见的可点物品，坐标相对于整张首帧。
+草稿物品未出现时，选择实际画出的、有教学意义的物品，改写名称和中英讲解。至少一个。
+返回 {"spots":[{"box":[左,上,右,下],"label":{"zh":"","en":""},"explain":{"zh":"","en":""}}]}。"""
+    context = {"本幕":scene["summary"],"教学目标":book["profile"].get("education",""),"候选物品":script["spots"]}
+    with Image.open(root/"assets"/scene["frame"]) as im:
+        return cached_ask(root,instructions.apply(task,book,"interaction"),context,[("最终首帧",im.convert("RGB"))],
+                          scene["frame"],lambda raw:validate_script({**script,"spots":raw["spots"]},scene),3000)
 
 
 def keywords(value):
@@ -367,5 +400,5 @@ def make_activities(root, book):
     task = ACTIVITY_TASK
     if book.get("creation"):
         task += "\n将学习目标与故事动作关联。FAQ 同时覆盖预设知识点和孩子可能提出的开放好奇问题，每条都给出可回看的情节线索。"
-    return cached_ask(root,task,{"资料卡":book["profile"],"全书":summaries},[],0,
+    return cached_ask(root,instructions.apply(task,book,"interaction"),{"资料卡":book["profile"],"全书":summaries},[],0,
                       lambda x:activities(x,book["scenes"]),11000)
