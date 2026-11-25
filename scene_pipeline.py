@@ -48,7 +48,9 @@ def prepare_script(root, context, beats, index, scene, designs):
 
 def run(root, book, scenes, languages, notice, *, frames_only=False):
     """The coordinator alone updates project.json. Workers handle detached scene snapshots."""
-    context = {k:book[k] for k in ("profile","pages","regions","creation","languages","voices","tts_model","rsi_prompts") if k in book}
+    prod.prepare_plot(root,book,notice)
+    context = {k:book[k] for k in ("profile","pages","regions","creation","languages","voices","tts_model",
+                                  "rsi_prompts","plot_nodes") if k in book}
     service = book.get("video_provider","heygen")
     video_limit = 1 if service == "heygen" else 3
     events = Queue()

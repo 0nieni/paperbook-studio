@@ -19,6 +19,7 @@ import editorial as ed
 import providers as api
 import motion
 import original_story
+import quality
 from rsi import instructions
 
 LANGS = ("zh","en")
@@ -107,6 +108,7 @@ def analyze(root,book,notice):
     notice("按情节核对印刷文字与对应画面")
     ed.review_assignments(root,scenes,regions,profile)
     book.update(scenes=scenes,regions=regions,layouts=layouts,profile=profile,activities=None,faq_audio={})
+    quality.capture_story(book)
     book["reference"] = art.character_sheet(root,profile)
     write(root,book)
 
@@ -129,6 +131,12 @@ def clear_script(scene):
     for role in ("tts","image2video","interaction"):
         scene.get("rsi_used",{}).pop(role,None)
     for key in ("script","cue_plan","redraw_lines","narration","planned_video_seconds","audio","video","video_seconds","video_source","task"):
+        scene.pop(key,None)
+    clear_film_review(scene)
+
+
+def clear_film_review(scene):
+    for key in ("film_review","film_retry","film_retry_used"):
         scene.pop(key,None)
 
 
@@ -380,18 +388,120 @@ def animate_book(root, book, scenes, notice):
 
 def recover(root,book,sid,task):
     s = next((s for s in book["scenes"] if s["id"]==sid),None)
-    if not s or not s.get("task") or s["task"]["state"]!="submitting":
+    receipt = (s.get("film_retry",{}).get("task") or s.get("task")) if s else None
+    if not receipt or receipt["state"]!="submitting":
         raise ValueError("这幕没有待恢复的提交。")
     if task and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}",task):
         raise ValueError("任务号格式无效。")
     journal={"id":task,"state":"pending" if task else "failed"}
-    service = s["task"].get("provider", "minimax")
+    service = receipt.get("provider", "minimax")
     journal["provider"] = service
-    if s["task"].get("auth"):
-        journal["auth"] = s["task"]["auth"]
-    api.save_json(motion.directory_record(root,service,s["task"]["key"]),journal)
-    s["task"].update(journal)
+    if receipt.get("auth"):
+        journal["auth"] = receipt["auth"]
+    api.save_json(motion.directory_record(root,service,receipt["key"]),journal)
+    receipt.update(journal)
     write(root,book)
+
+
+def prepare_plot(root,book,notice):
+    before = (book.get("plot_nodes"),[s.get("plot_ids") for s in book["scenes"]])
+    quality.prepare_plot(root,book,notice)
+    if before != (book["plot_nodes"],[s["plot_ids"] for s in book["scenes"]]):
+        write(root,book)
+
+
+def review_spot_audio(root,book,scene,review):
+    original = {spot["id"] for spot in scene["script"]["spots"]}
+    extra = [spot for spot in review["spots"] if spot["id"] not in original]
+    if extra:
+        review["spot_audio"] = {
+            lang:{spot["id"]:recording(root,spot["explain"][lang],explanation_direction(lang),
+                                       lang,*recording_style(book,lang)) for spot in extra}
+            for lang in languages(book)
+        }
+
+
+def review_films(root,book,scenes,notice,*,retry=False,force=False,required=False):
+    candidates = [s for s in scenes if s.get("video") and (root/"assets"/s["video"]).is_file()]
+    if not candidates and not required:
+        return []
+    prepare_plot(root,book,notice)
+    errors = []
+    for scene in scenes if required else candidates:
+        title = scene["title"]
+        try:
+            inputs = quality.inputs(book,scene)
+            if scene not in candidates or not scene.get("script") or any(
+                    not track or not (root/"assets"/track["file"]).is_file() for track in inputs):
+                if required:
+                    raise ValueError("请先完成本幕动画、制作稿和所选语言的朗读。")
+                continue
+            if quality.accepted(root,book,scene) and not force:
+                continue
+            notice(f"校验成片末帧与情节 · {title}")
+            review = quality.current_review(root,book,scene) or {}
+            if not scene.get("film_retry") and (
+                    force or review.get("key") != quality.review_key(book,scene) or review.get("state") != "needs_review"):
+                review = quality.evaluate(root,book,scene)
+                if review["state"] == "passed":
+                    review_spot_audio(root,book,scene,review)
+                scene["film_review"] = review
+                write(root,book)
+            if review.get("state") == "needs_review" and retry and not scene.get("film_retry_used") and (
+                    (scene.get("video_source") or {}).get("delivery") == "api"):
+                prompt = scene["script"]["video_prompt"] + "\n复核发现：" + "；".join(review["issues"])
+                prompt += "\n完整呈现本幕关键动作，末帧停稳并清楚保留关键道具。"
+                scene["film_retry"] = {"revision":uuid.uuid4().hex,"task":{},"prompt":prompt}
+                scene["film_retry_used"] = True
+                write(root,book)
+            if scene.get("film_retry") and retry:
+                pending = scene["film_retry"]
+                draft = {**deepcopy(scene),"animation_revision":pending["revision"],"task":pending["task"]}
+                draft.pop("video",None)
+                draft["script"]["video_prompt"] = pending["prompt"]
+                service = scene["video_source"]["provider"]
+
+                def checkpoint():
+                    pending["task"] = draft["task"]
+                    write(root,book)
+
+                notice(f"按成片校验结果重生成一次 · {title}")
+                try:
+                    motion.animate(root,draft,service,notice,checkpoint)
+                except (RuntimeError,ValueError,OSError):
+                    if pending["task"].get("state") not in {"pending","submitting"}:
+                        scene.pop("film_retry",None)
+                        write(root,book)
+                    raise
+                for field in ("video","video_seconds","video_source","task","animation_revision"):
+                    scene[field] = draft[field]
+                scene.pop("film_retry",None)
+                scene.pop("film_review",None)
+                write(root,book)
+                review = quality.evaluate(root,book,scene)
+                if review["state"] == "passed":
+                    review_spot_audio(root,book,scene,review)
+                scene["film_review"] = review
+                write(root,book)
+            if review["state"] == "needs_review":
+                errors.append(f"「{title}」待人工复核 · "+" / ".join(review["issues"]))
+        except (ValueError,RuntimeError,OSError,KeyError,TypeError,AttributeError) as error:
+            errors.append(f"「{title}」成片校验待处理 · {error}")
+    return errors
+
+
+def observation_available(root,book):
+    acts = book.get("activities")
+    if not acts:
+        return False
+    ob = acts.get("observation")
+    if not ob:
+        return True
+    scene = next((s for s in book["scenes"] if s["id"] == ob["scene"]),None)
+    if not scene or not scene.get("script"):
+        return False
+    spots = scene["film_review"]["spots"] if quality.accepted(root,book,scene) else scene["script"]["spots"]
+    return any(h["id"] == ob["spot"] for h in spots)
 
 
 def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
@@ -412,6 +522,7 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
                 raise RuntimeError(" / ".join(errors))
         elif book.get("visual_version")!=original_story.VISUAL_VERSION:
             original_story.generate(root,book,notice,redraw=True)
+            quality.capture_story(book)
         save()
         return
     if action=="build":
@@ -437,13 +548,18 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
         scene = next((s for s in book["scenes"] if s["id"]==sid),None)
         if not scene:
             raise ValueError("请先选择要重新制作的分镜。")
-        if scene.get("video"):
-            for key in ("video","video_seconds","video_source","task","planned_video_seconds"):
-                scene.pop(key,None)
-            scene["animation_revision"] = uuid.uuid4().hex
-            save()
-        from scene_pipeline import run
-        errors = run(root,book,[scene],languages(book),notice)
+        if scene.get("film_retry"):
+            errors = review_films(root,book,[scene],notice,retry=True,required=True)
+        else:
+            if scene.get("video"):
+                for key in ("video","video_seconds","video_source","task","planned_video_seconds"):
+                    scene.pop(key,None)
+                scene["animation_revision"] = uuid.uuid4().hex
+                clear_film_review(scene)
+                save()
+            from scene_pipeline import run
+            errors = run(root,book,[scene],languages(book),notice)
+            errors.extend(review_films(root,book,[scene],notice,retry=True))
         if errors:
             raise RuntimeError(" / ".join(errors))
         if any(not s.get("script") or not set(languages(book)) <= s.get("audio",{}).keys() for s in book["scenes"]):
@@ -451,7 +567,8 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
         else:
             make(root,book,"activities","","",notice)
             faq_speech(root,book,languages(book),notice,save)
-            make(root,book,"export" if all(s.get("video") for s in book["scenes"]) else "proof","","",notice)
+            complete = all(quality.accepted(root,book,s) for s in book["scenes"])
+            make(root,book,"export" if complete else "proof","","",notice)
         return
     if action=="import":
         book["pages"]=art.render_pages(root,notice)
@@ -470,9 +587,25 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
     if lang and lang not in enabled:
         raise ValueError("此作品未选择该配音语言。")
     langs = (lang,) if lang else enabled
+    if action == "review_film":
+        errors = review_films(root,book,scenes,notice,retry=True,force=True,required=True)
+        if errors:
+            raise RuntimeError(" / ".join(errors))
+        return
+    if action == "approve_film":
+        scene = scenes[0]
+        review = quality.current_review(root,book,scene)
+        if (not sid or not review or review["state"] != "needs_review" or not review["spots"] or
+                scene.get("film_retry")):
+            raise ValueError("本幕需要先校验当前成片，并至少保留一个已验证的可点物品。")
+        review_spot_audio(root,book,scene,review)
+        review["state"] = "approved"
+        save()
+        return
     if action in {"all","sample"}:
         from scene_pipeline import run
         errors = run(root,book,scenes,langs,notice)
+        errors.extend(review_films(root,book,scenes,notice,retry=True))
         if action=="all" and all(s.get("script") for s in book["scenes"]):
             make(root,book,"activities","","",notice)
             faq_speech(root,book,langs,notice,save)
@@ -486,8 +619,15 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
             if any(not s.get("script") for s in book["scenes"]):
                 raise ValueError("请先生成全书的逐幕制作稿。")
             notice("DeepSeek 编写观察题、双语问答和六道小测")
+            if book.get("activities") and not observation_available(root,book):
+                book["activities"] = None
+                book["faq_audio"] = {}
             if not book.get("activities"):
-                book["activities"]=ed.make_activities(root,book)
+                activity_book = {**book,"scenes":[
+                    {**s,"script":{**s["script"],"spots":s["film_review"]["spots"]}}
+                    if quality.accepted(root,book,s) else s for s in book["scenes"]
+                ]}
+                book["activities"]=ed.make_activities(root,activity_book)
                 save()
             continue
         if step in {"export","proof","reel"}:
@@ -496,6 +636,10 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
                 animated = [s for s in scenes if s.get("video") and (root/"assets"/s["video"]).is_file()]
                 if not animated:
                     raise ValueError("还没有已完成的动画镜头。")
+                errors = review_films(root,book,animated,notice,retry=True)
+                animated = [s for s in animated if quality.accepted(root,book,s)]
+                if not animated:
+                    raise ValueError(" / ".join(errors) or "还没有通过校验的动画镜头。")
                 book["sample_edition"] = publish(root,book,animated,partial=True)
                 save()
                 continue
@@ -504,6 +648,13 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
             notice("组装离线播放器、双语字幕和制作稿")
             if step=="proof" and sid:
                 raise ValueError("整书校对版请选择全书范围。")
+            if step=="export":
+                errors = review_films(root,book,scenes,notice,retry=True,required=True)
+                if errors:
+                    raise RuntimeError(" / ".join(errors))
+                if not sid and not observation_available(root,book):
+                    make(root,book,"activities","","",notice)
+                    faq_speech(root,book,enabled,notice,save)
             edition = publish(root,book,scenes,partial=bool(sid),proof=step=="proof")
             book["proof_edition" if step=="proof" else ("sample_edition" if sid else "edition")]=edition
             if not sid:
@@ -511,7 +662,11 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
             save()
             continue
         if step=="video" and len(scenes)>1:
+            prepare_plot(root,book,notice)
             animate_book(root,book,scenes,notice)
+            errors = review_films(root,book,scenes,notice,retry=True)
+            if errors:
+                raise RuntimeError(" / ".join(errors))
             continue
         for i,s in enumerate(scenes,1):
             notice(f"{i}/{len(scenes)} · {s['title']}")
@@ -524,6 +679,7 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
                 if not s.get("frame"):
                     raise ValueError(f"请先清理「{s['title']}」的首帧。")
                 if not s.get("script"):
+                    prepare_plot(root,book,notice)
                     s["script"] = ed.locate_spots(root,book,s) if s.get("cue_plan") else ed.draft(root,book,book["scenes"].index(s))
                     s.pop("cue_plan",None)
                     instructions.stamp(s,book,"tts","image2video","interaction")
@@ -539,11 +695,16 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
                     raise ValueError("请先完成本幕首帧和动作提示。")
                 if s.get("clean_review") and not s.get("clean_approved"):
                     raise ValueError(f"请先在清图对照中核对「{s['title']}」的残留标记。")
+                prepare_plot(root,book,notice)
                 if motion.pin_duration(s,enabled):
                     save()
                 motion.animate(root,s,book.get("video_provider","heygen"),notice,save)
             else:
                 raise ValueError("未知的制作步骤。")
             save()
+        if step in {"video","voice"}:
+            errors = review_films(root,book,scenes,notice,retry=True)
+            if errors:
+                raise RuntimeError(" / ".join(errors))
         if step=="voice" and not sid:
             faq_speech(root,book,langs,notice,save)

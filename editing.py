@@ -133,6 +133,7 @@ def edit(root,book,body):
                 if script["video_prompt"]!=was["script"]["video_prompt"]:
                     for key in ("video","video_seconds","video_source","task","planned_video_seconds"):
                         s.pop(key,None)
+                    prod.clear_film_review(s)
             s["script"]=script
         if model!=book["tts_model"]:
             s.pop("audio",None)

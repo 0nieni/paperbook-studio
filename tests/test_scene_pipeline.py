@@ -31,6 +31,19 @@ def manuscript(i, sources=()):
             "spots":[{"box":[.1,.2,.3,.4],"label":pair("星星"),"explain":pair(f"Star {i}")}]}
 
 
+class FilmProviderTests(unittest.TestCase):
+    def test_retelling_uses_existing_bailian_endpoint_and_embeds_video(self):
+        response = {"choices":[{"message":{"content":'{"retelling":"test","events":[]}'}}]}
+        with patch.object(providers,"bailian",return_value="https://dashscope.aliyuncs.com"), \
+                patch.object(providers,"request",return_value=response) as request:
+            result = providers.retell_video(b"test clip")
+        provider, url, body = request.call_args.args
+        self.assertEqual(provider,"千问")
+        self.assertEqual(url,"https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+        self.assertEqual(body["messages"][0]["content"][0]["video_url"]["url"],"data:;base64,dGVzdCBjbGlw")
+        self.assertEqual(result["retelling"],"test")
+
+
 class PipelineTests(unittest.TestCase):
     def setUp(self):
         stack = self.enterContext(ExitStack())
@@ -44,18 +57,38 @@ class PipelineTests(unittest.TestCase):
         self.writers = None
         self.submissions = []
         self.query_order = []
+        self.missing_plot = False
+        self.blank_hotspot = False
+        self.replacement_hotspot = False
+        self.retold_seconds = []
         stack.enter_context(patch.object(providers,"request",side_effect=AssertionError("网络必须由测试替身接管")))
         stack.enter_context(patch.object(providers,"ask",side_effect=self.ask))
+        stack.enter_context(patch.object(providers,"retell_video",self.retell,create=True))
         stack.enter_context(patch.object(providers,"illustrate",side_effect=self.illustrate))
         stack.enter_context(patch.object(providers,"voice",side_effect=self.voice))
         stack.enter_context(patch.object(providers,"start_video",side_effect=self.start_video))
         stack.enter_context(patch.object(providers,"query_video",side_effect=self.query_video))
         self.clip = Path(self.root.parent/"fixture.mp4")
-        providers.run_binary(["ffmpeg","-nostdin","-loglevel","error","-f","lavfi","-i","color=c=blue:s=64x36:r=12",
-                              "-t","0.5","-c:v","libx264","-pix_fmt","yuv420p",str(self.clip)],check=True,timeout=30)
+        providers.run_binary(["ffmpeg","-nostdin","-loglevel","error","-f","lavfi","-i",
+                              "color=blue:s=64x36:r=12:d=0.5,drawbox=0:0:iw:ih:red:t=fill:enable=gte(t\\,0.25)",
+                              "-c:v","libx264","-pix_fmt","yuv420p",str(self.clip)],check=True,timeout=30)
         stack.enter_context(patch.object(providers,"fetch_media",return_value=self.clip.read_bytes()))
 
     def ask(self,task,ctx,images,tokens):
+        if "情节原稿" in ctx:
+            return {"events":[{"action":ctx["情节原稿"]["summary"],"cause":"","result":"","part":1,
+                               "box":[.2,.2,.4,.4],"sources":[]}]}
+        if "成片候选物品" in ctx:
+            self.assertGreater(images[0][1].getpixel((640,360))[0],200)
+            if self.replacement_hotspot:
+                return {"spots":[],"replacement":{"box":[.65,.5,.80,.75],"label":pair("红灯"),"explain":pair("红色的灯")}}
+            return {"spots":[{"id":h["id"],"box":[.65,.5,.80,.75],
+                              **({"source":{"part":1,"box":[.15,.2,.3,.4]}} if len(images)>1 else {})}
+                             for h in ctx["成片候选物品"]]}
+        if "核对物品裁图" in ctx:
+            return {"verified":[h["id"] for h in ctx["核对物品裁图"] if not self.blank_hotspot]}
+        if "情节核对清单" in ctx:
+            return {"matches":{n["id"]:(None if self.missing_plot else 1) for n in ctx["情节核对清单"]}}
         if "创作设定" in ctx:
             self.calls["outline"] += 1
             return {"profile":self.profile,"scenes":[{"title":f"第{i}幕","summary":f"发生事件{i}"} for i in range(1,7)]}
@@ -92,12 +125,21 @@ class PipelineTests(unittest.TestCase):
         if "全书" in ctx:
             ids=[s["id"] for s in ctx["全书"]]
             qa={"question":pair("看到什么？"),"hint":pair("看一看"),"evidence":ids}
-            return {"observation":{"scene":ids[0],"spot":"h1",**qa},
+            return {"observation":{"scene":ids[0],"spot":ctx["全书"][0]["spots"][0]["id"],**qa},
                     "faq":[{**qa,"reply":pair("看见星星")}],
                     "quiz":[{**qa,"mode":mode,"explain":pair("星星"),"options":[pair(s) for s in "ABC"],
                              "answer":[0,1,2] if mode=="order" else 0} for mode in
                             ["choice","order","choice","choice","choice","open"]]}
         raise AssertionError(list(ctx))
+
+    def retell(self, clip):
+        streams = providers.run_binary(["ffprobe","-v","error","-show_entries","stream=codec_type",
+                                       "-of","csv=p=0","-i","pipe:0"],input=clip,capture_output=True,check=True)
+        self.assertEqual(streams.stdout.split(),[b"video",b"audio"])
+        probe = providers.run_binary(["ffprobe","-v","error","-show_entries","format=duration",
+                                     "-of","csv=p=0","-i","pipe:0"],input=clip,capture_output=True,check=True)
+        self.retold_seconds.append(round(float(probe.stdout.strip()),1))
+        return {"retelling":"看见一颗星","events":[{"time":0.1,"visible":"一颗星","spoken":"看星星"}]}
 
     def illustrate(self,prompt):
         i=int(re.search(r"地点(\d+)",prompt)[1])
@@ -153,6 +195,64 @@ class PipelineTests(unittest.TestCase):
         book=production.read(self.root)
         production.make(self.root,book,"build","","",lambda msg:None)
         return production.read(self.root)
+
+    def test_export_pairs_actual_last_frame_with_verified_hotspot(self):
+        self.new_book()
+        book = self.build()
+        dest = self.root/"editions"/book["edition"]["id"]
+        model = json.loads((dest/"book.js").read_text(encoding="utf-8").split("=",1)[1].strip().rstrip(";"))
+        shot = model["scenes"][0]
+        self.assertNotEqual(shot["interaction_frame"],shot["frame"])
+        self.assertEqual(shot["interaction_spots"][0]["box"],[.65,.5,.80,.75])
+        self.assertEqual(shot["script"]["spots"][0]["box"],[.5,.2,.7,.4])
+        with Image.open(dest/"assets"/shot["interaction_frame"]) as frame:
+            self.assertGreater(frame.getpixel((640,360))[0],200)
+        self.assertTrue(shot["plot_ids"])
+        self.assertEqual(Counter(self.retold_seconds),{.6:6,.8:6})
+
+    def test_failed_visual_review_retries_once_and_exports_static_proof(self):
+        self.new_book()
+        self.missing_plot = self.blank_hotspot = True
+        with self.assertRaisesRegex(RuntimeError,"人工复核"):
+            self.build()
+        book = production.read(self.root)
+        self.assertEqual(self.submissions.count(1),2)
+        self.assertEqual(book["scenes"][0]["film_review"]["state"],"needs_review")
+        self.assertEqual(book["scenes"][0]["film_review"]["spots"],[])
+        self.assertEqual(book["proof_edition"]["animated"],0)
+        with self.assertRaisesRegex(RuntimeError,"人工复核"):
+            self.build()
+        self.assertEqual(self.submissions.count(1),2)
+
+    def test_replacement_hotspot_has_offline_explanation_audio(self):
+        self.new_book()
+        self.replacement_hotspot = True
+        book = self.build()
+        dest = self.root/"editions"/book["edition"]["id"]
+        model = json.loads((dest/"book.js").read_text(encoding="utf-8").split("=",1)[1].strip().rstrip(";"))
+        shot = model["scenes"][0]
+        self.assertEqual([h["label"]["zh"] for h in shot["interaction_spots"]],["红灯"])
+        replacement = shot["interaction_spots"][0]["id"]
+        self.assertEqual(model["activities"]["observation"]["spot"],replacement)
+        for language in ("zh","en"):
+            self.assertTrue((dest/"assets"/shot["audio"][language]["spots"][replacement]).is_file())
+
+    def test_resuming_automatic_retry_updates_full_edition_without_resubmitting(self):
+        self.new_book()
+        before = self.build()
+        sid = before["scenes"][0]["id"]
+        self.missing_plot = self.interrupt = True
+        with self.assertRaisesRegex(RuntimeError,"查询中断"):
+            production.make(self.root,before,"review_film",sid,"",lambda msg:None)
+        saved = production.read(self.root)
+        self.assertEqual(saved["scenes"][0]["film_retry"]["task"]["state"],"pending")
+        self.assertEqual(saved["edition"],before["edition"])
+        self.missing_plot = False
+        production.make(self.root,saved,"refresh_scene",sid,"",lambda msg:None)
+        after = production.read(self.root)
+        self.assertNotEqual(after["edition"]["id"],before["edition"]["id"])
+        self.assertEqual(after["edition"],after["play_edition"])
+        self.assertEqual(self.submissions.count(1),2)
 
     def test_streamed_book_with_out_of_order_video_and_real_subtitle_timing(self):
         self.overlap=True
@@ -275,6 +375,14 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(book["edition"]["scenes"],["p001-s1","p001-s2"])
         self.assertEqual(self.calls["pdfplan",1],1)
         self.assertEqual(self.calls["pdfplan",2],1)
+        self.assertEqual(len(self.submissions),2)
+        source = scenes[1]["film_review"]["spots"][0]["source"]
+        self.assertEqual(source["page"],scenes[1]["parts"][0]["page"])
+        self.assertGreaterEqual(source["box"][0],scenes[1]["parts"][0]["box"][0])
+        self.assertLessEqual(source["box"][2],scenes[1]["parts"][0]["box"][2])
+        scenes.reverse()
+        with self.assertRaisesRegex(ValueError,"分镜顺序有误"):
+            production.make(self.root,book,"video","","",lambda msg:None)
         self.assertEqual(len(self.submissions),2)
 
     def test_unapproved_pdf_frame_only_pauses_its_own_animation(self):

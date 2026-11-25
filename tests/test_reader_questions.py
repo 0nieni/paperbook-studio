@@ -17,8 +17,9 @@ class EditionQuestions(unittest.TestCase):
         folder.mkdir(parents=True)
         script = {"title": {"zh": "井沿", "en": "At the well"},
                   "lines": [{"role": "小鸟", "zh": "河水流向远方。", "en": "The river flows far away."}],
-                  "spots": []}
-        book = {"title": "小青蛙", "scenes": [{"id": "bird", "script": script}]}
+                  "spots": [{"label":{"en":"Sun"},"explain":{"en":"The sun is warm."}}]}
+        book = {"title": "小青蛙", "scenes": [{"id": "bird", "script": script, "interaction_spots":[
+            {"label":{"en":"River"},"explain":{"en":"The river goes far away."}}]}]}
         (folder / "book.js").write_text("window.EDITION = " + json.dumps(book) + ";", encoding="utf-8")
         self.body = {"question": "What did the bird say?", "language": "en", "scene": "bird", "edition": self.version}
         env = patch("reader_questions.providers.setting", return_value="configured")
@@ -32,6 +33,7 @@ class EditionQuestions(unittest.TestCase):
         self.assertEqual(answer, {"reply": ask.return_value["answer"], "evidence": ["bird"]})
         context = ask.call_args.args[1]
         self.assertEqual(context["scenes"][0]["lines"], [["小鸟", "The river flows far away."]])
+        self.assertEqual(context["scenes"][0]["objects"], [["River","The river goes far away."]])
         self.assertEqual(context["language"], "en")
 
     @patch("reader_questions.providers.ask")

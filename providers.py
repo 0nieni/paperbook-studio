@@ -18,6 +18,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent
 SKILL = ROOT / "picturebook-studio" / "SKILL.md"
 DS = "deepseek-flash"
+OMNI = "qwen3.8-omni-flash"
 IMAGE = "qwen-image-2.0-pro"
 TTS = "qwen-audio-3.1-tts-flash"
 VIDEO = "MiniMax-H3"
@@ -131,7 +132,7 @@ def request(provider, url, body=None, timeout=210, *, attempts=5):
             continue
         err = obj.get("error") or ({"code":base_code,"message":base.get("status_msg")} if base_code else obj)
         why = str(err.get("message") or err.get("code") or "接口错误") if isinstance(err, dict) else str(err)
-        why = re.sub(r"https?://\S+|data:image/\S+|sk-[a-zA-Z0-9_-]+", "[已省略]", why.replace(key, "[已隐藏]"))
+        why = re.sub(r"https?://\S+|data:[^\s,]*;base64,\S+|sk-[a-zA-Z0-9_-]+", "[已省略]", why.replace(key, "[已隐藏]"))
         code = str(err.get("code") or "")[:40] if isinstance(err, dict) else ""
         message = f"{provider} HTTP {status.decode()} · {code} {why[:240]}".strip()
         if provider in {"MiniMax","MiniMax 订阅"} and code=="2068":
@@ -188,6 +189,31 @@ def ask(task, context, images=(), tokens=10000, *, system=None, timeout=210, att
         return result
     except (TypeError, ValueError, KeyError):
         raise ValueError("DeepSeek 未返回完整的 JSON 对象，可重试当前步骤。") from None
+
+
+def retell_video(clip):
+    encoded = base64.b64encode(clip).decode("ascii")
+    if len(encoded) >= 10_000_000:
+        raise ValueError("成片与配音的校验文件超过百炼本地视频输入大小。")
+    task = ("只根据这段成片的画面和实际声音，按时间复述本幕。分开记录眼睛能看到的动作与旁白实际说出的内容。"
+            "只有旁白提到的事件，visible 填空字符串。画面或声音不清楚时如实记载。"
+            '返回 {"retelling":"","events":[{"time":0.0,"visible":"","spoken":""}]}，时间单位为秒。')
+    result = request("千问",f"{bailian()}/compatible-mode/v1/chat/completions",{
+        "model":OMNI, "modalities":["text"], "stream":False, "reasoning_effort":"none",
+        "response_format":{"type":"json_object"}, "max_tokens":3500,
+        "messages":[{"role":"user","content":[
+            {"type":"video_url","video_url":{"url":"data:;base64,"+encoded}},
+            {"type":"text","text":task}
+        ]}]
+    },attempts=2)
+    try:
+        choice = result["choices"][0]
+        observation = json.loads(choice["message"]["content"])
+        if choice.get("finish_reason") == "length" or not isinstance(observation,dict):
+            raise ValueError
+        return observation
+    except (KeyError,IndexError,TypeError,ValueError):
+        raise ValueError("千问未返回完整的成片复述。") from None
 
 
 def edit_art(original, marked, target="", note=""):

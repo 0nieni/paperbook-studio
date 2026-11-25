@@ -113,6 +113,9 @@ def outline(root, book):
         pages.append({"n":n,"width":1280,"height":720,"text":"","objects":[]})
     book.update(profile=profile,scenes=scenes,layouts=layouts,pages=pages,regions=[],
                 pending_source_pdf=True,visual_version=VISUAL_VERSION)
+    # Keep the approved source outline independently of later scene edits.
+    from quality import capture_story
+    capture_story(book)
 
 
 def scene_prompt(root, book, index):
@@ -137,6 +140,7 @@ def scene_prompt(root, book, index):
 
     context = {"资料卡":book["profile"],"家长设定":book["creation"]["brief"],"当前幕":scene["id"],
                "故事大纲":[ed.scene_brief(s) for s in book["scenes"]],"其他已定画面设计":prior}
+    context["本幕情节节点"] = [n for n in book.get("plot_nodes",[]) if n["id"] in scene.get("plot_ids",[])]
     return ed.cached_ask(root,instructions.apply(task,book,"story","tts","image2video","interaction"),
                          context,[],VISUAL_VERSION,validate,5500)
 

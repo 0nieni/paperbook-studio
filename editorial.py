@@ -17,7 +17,7 @@ PROFILE_TASK = """依据全书逐页摘要和原文输出资料卡 JSON：
 {"title":"","original_language":"","direction":"ltr或rtl","age":"","education":"主题及具体原页依据","style":"","glossary":"角色和专名的中英写法","summary":"前因后果","characters":[{"name":"","features":"固定可见特征","refs":[{"page":1,"box":[0,0,1,1],"view":"已可见角度"}]}]}。角色参考取原书真实所在区域，可提供多种角度，未见角度勿捏造。title 用原书正式书名。"""
 SCRIPT_TASK = """读取原文、资料卡及清图，按照技能编写仅当前场景的分镜和配音稿。输出 JSON：
 {"title":{"zh":"","en":""},"lines":[{"role":"旁白或角色名","sources":["原文ID"],"zh":"只读的中文正文","en":"English spoken text","direction":{"zh":"普通话表演指令","en":"English performance direction"}}],"video_prompt":"可直接发给 HeyGen Video 1 或 MiniMax H3 的完整英文或中文首帧动作提示，含起始构图、可见动作、结束姿势与静音","spots":[{"label":{"zh":"","en":""},"box":[左,上,右,下],"explain":{"zh":"","en":""}}],"clean_warnings":[]}。
-每个原文旁白和对白都要有对应的 sources；已有双语合用同一条。来源为当前语言时逐字保留正文，数字、次序和对话尤其要精确，不要复述相邻幕或再配额外描述。无字图可依据画面补一句简短旁白。每次说话人变化就换行，长句自然分句。至少一条双语朗读和一个清晰可点物品。每条配音使用儿童能听懂的自然语句；不在正文里写表演说明。spots 的 0~1 坐标相对清理后的 16:9 整张首帧。对照原图与清理图查残字、气泡轮廓和被改坏的脸或道具；确有问题写入 clean_warnings，出版标记和道具文字均可保留。"""
+每个原文旁白和对白都要有对应的 sources；已有双语合用同一条。来源为当前语言时逐字保留正文，数字、次序和对话尤其要精确，不要复述相邻幕或再配额外描述。无字图可依据画面补一句简短旁白。每次说话人变化就换行，长句自然分句。至少一条双语朗读和一个清晰可点物品。每条配音使用儿童能听懂的自然语句；不在正文里写表演说明。spots 的 0~1 坐标相对清理后的 16:9 整张首帧。按本幕情节节点的顺序写入可见动作，要求成片末帧停稳且候选互动道具清晰可见。对照原图与清理图查残字、气泡轮廓和被改坏的脸或道具；确有问题写入 clean_warnings，出版标记和道具文字均可保留。"""
 ACTIVITY_TASK = """为这一本书生成可离线使用的双语互动 JSON。所有 zh/en 字段写同义的自然中英文，evidence 只能列给定场景 ID。
 {"faq":[{"question":{"zh":"","en":""},"reply":{"zh":"","en":""},"keywords":{"zh":[""],"en":[""]},"evidence":["场景ID"]}],
 "observation":{"scene":"场景ID","spot":"该幕实际热点ID","question":{"zh":"","en":""},"hint":{"zh":"","en":""}},
@@ -304,6 +304,7 @@ def draft(root, book, i, before_frame=False):
     context = {"资料卡":book["profile"],"前一幕":scenes[i-1]["summary"] if i else "",
                "后一幕":scenes[i+1]["summary"] if i+1<len(scenes) else "",
                "当前场景":scene_brief(s),"逐句原文":[r for r in book["regions"] if r["id"] in s["sources"]]}
+    context["本幕情节节点"] = [n for n in book.get("plot_nodes",[]) if n["id"] in s.get("plot_ids",[])]
     images = []
     task = SCRIPT_TASK
     if before_frame:
