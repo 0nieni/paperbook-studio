@@ -31,7 +31,8 @@ def answer(root, body):
         script = s["script"]
         scenes.append({"id": s["id"], "title": script["title"][lang],
                        "lines": [[line.get("role", ""), line[lang]] for line in script["lines"]],
-                       "objects": [[spot["label"][lang], spot["explain"][lang]] for spot in script.get("spots", [])]})
+                       "objects": [[spot["label"][lang], spot["explain"][lang]]
+                                   for spot in s.get("interaction_spots",script.get("spots",[]))]})
     ids = {s["id"] for s in scenes}
     if not isinstance(current, str) or current not in ids:
         raise ValueError("当前分镜不属于此版本。")

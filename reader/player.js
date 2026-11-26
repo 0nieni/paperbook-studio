@@ -41,10 +41,10 @@ function localize() {
   shots = edition.scenes.map(s => {
     const track = s.audio[locale], sc = s.script;
     media[s.id] = {...track, inset:[0,0,1,1]};
-    const spots = sc.spots.map(h => {
+    const spots = (s.interaction_spots ?? sc.spots).map(h => {
       const [x,y,r,b] = h.box;
       sound[s.id+"-"+h.id] = track.spots[h.id];
-      return [h.id,h.label[locale],(x+r)/2,(y+b)/2,r-x,b-y,h.explain[locale]];
+      return [h.id,h.label[locale],(x+r)/2,(y+b)/2,r-x,b-y,h.explain[locale],h.source];
     });
     return {id:s.id,title:sc.title[locale],page:s.pages.join(" / "),crop:[0,0,1,1],spots,raw:s};
   });
@@ -65,6 +65,7 @@ const $ = (id) => document.getElementById(id);
 const narration = $("narration");
 const explanation = $("explanation");
 const video = $("video");
+const transitionFrame = $("transition-frame");
 const quizDialog = $("quiz");
 const timeline = $("timeline");
 const rail = $("scenes");
@@ -134,7 +135,11 @@ function renderControls() {
   $("frame-note").hidden = !state.exploring;
   const showVideo = state.videoReady && state.started && !state.exploring;
   video.hidden = !showVideo;
-  $("frame").hidden = showVideo;
+  const frame = $("frame");
+  const scene = shots[state.shot].raw;
+  const image = asset(state.exploring && scene.interaction_frame ? scene.interaction_frame : scene.frame);
+  if (frame.getAttribute("src") !== image) frame.src = image;
+  frame.hidden = showVideo;
   $("continue").hidden = !state.exploring || state.observation;
   $("ask-continue").hidden = !state.resume;
   renderClock();
@@ -142,13 +147,17 @@ function renderControls() {
 
 function syncVideo() {
   if (!state.playing || !state.videoReady || state.exploring || !video.duration) return;
-  const rate = video.duration / media[shots[state.shot].id].duration;
+  const rate = videoRate(shots[state.shot]);
   video.playbackRate = Math.max(.25, Math.min(2, rate));
   const targetTime = Math.min(video.duration - .025, narration.currentTime * video.playbackRate);
   if (Math.abs(video.currentTime - targetTime) > .19) video.currentTime = targetTime;
   if (video.paused && !video.ended && targetTime < video.duration - .05) {
     video.play().catch(() => {});
   }
+}
+
+function videoRate(shot) {
+  return shot.raw.cinematic ? 1 : Math.max(.25, Math.min(2, video.duration / media[shot.id].duration));
 }
 
 function stopExplanation() {
@@ -199,6 +208,11 @@ function play() {
 }
 
 function showShot(index, time = 0, autoplay = false) {
+  const previous = shots[state.shot];
+  const fade = index !== state.shot && autoplay && previous.raw.cinematic && shots[index].raw.cinematic &&
+    !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  transitionFrame?.getAnimations().forEach(animation => animation.cancel());
+  if (transitionFrame) transitionFrame.hidden = true;
   pause();
   stopExplanation();
   state.shot = index;
@@ -229,6 +243,12 @@ function showShot(index, time = 0, autoplay = false) {
   renderObjects();
   renderSuggestions();
   renderControls();
+  if (fade && transitionFrame) {
+    transitionFrame.src = asset(previous.raw.interaction_frame || previous.raw.frame);
+    transitionFrame.hidden = false;
+    const animation = transitionFrame.animate({opacity:[1,0]}, {duration:280,fill:"forwards"});
+    animation.onfinish = () => { transitionFrame.hidden = true; };
+  }
   if (autoplay) play();
 }
 
@@ -243,7 +263,7 @@ function seekTo(seconds, autoplay = state.playing) {
   }
   state.seek = offset;
   if (narration.readyState) narration.currentTime = offset;
-  if (state.videoReady) video.currentTime = Math.max(0, offset / media[shots[index].id].duration * video.duration - .02);
+  if (state.videoReady) video.currentTime = Math.max(0,Math.min(video.duration-.025,offset*videoRate(shots[index])));
   renderControls();
 }
 
@@ -324,6 +344,7 @@ function selectSpot(id) {
     return;
   }
   answer.replaceChildren(element("strong", "", spot[1]), element("p", "", spot[6]));
+  if (spot[7]) answer.append(element("small", "", tr(`原书第 ${spot[7].page} 页`, `Source page ${spot[7].page}`)));
   answer.hidden = false;
   speak(`${shot.id}-${id}`);
 }
@@ -676,7 +697,7 @@ function openQuiz() {
 function translateControls() {
   const labels = [
     ["#quiz-top", "阅读小测", "Story quiz"], ["#quiz-title", "阅读小测", "Story quiz"],
-    ["#start", "开始观看", "Start reading"], ["#frame-note", "首帧观察 · 点一下标记", "Tap a marker to explore"],
+    ["#start", "开始观看", "Start reading"], ["#frame-note", "点一下标记来探索", "Tap a marker to explore"],
     ["#find", "找一找", "Explore"], ["#objects-tab", "找一找", "Explore"], ["#ask-tab", "问一问", "Ask"],
     ["#continue", "从原处继续播放", "Resume story"], ["#ask-continue", "从原处继续播放", "Resume story"],
     [".send", "发送", "Send"], [".companion-head h2", "故事伙伴", "Story companion"],

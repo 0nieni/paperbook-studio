@@ -1,4 +1,5 @@
 """Assemble silent picture-book shots and resume work with the selected video service."""
+from contextlib import ExitStack
 import hashlib
 import json
 import math
@@ -8,10 +9,12 @@ import uuid
 
 from PIL import Image
 
+import cinema
 import providers as api
 
 MODELS = {"heygen": api.HEYGEN, "minimax": api.VIDEO}
 LABELS = {"heygen": "HeyGen", "minimax": "MiniMax H3"}
+MODEL_LIMITS = {"heygen": (5, 30), "minimax": (4, 15)}
 
 
 def directory_record(root, service, key):
@@ -43,7 +46,7 @@ def pin_duration(scene, languages):
 
 
 def frame_recipe(scene, service):
-    low, high = (5, 30) if service == "heygen" else (4, 15)
+    low, high = MODEL_LIMITS[service]
     measured = scene.get("planned_video_seconds") or max(track["duration"] for track in scene["audio"].values())
     seconds = min(high, max(low, math.ceil(measured)))
     prompt = scene["script"]["video_prompt"] + f"\nSingle continuous shot, {seconds} seconds. Hold the final composition. Silent; no new lettering, captions or speech balloons."
@@ -53,7 +56,8 @@ def frame_recipe(scene, service):
 def render_recipe(scene, service):
     seconds, prompt = frame_recipe(scene, service)
     revision = [scene["animation_revision"]] if scene.get("animation_revision") else []
-    key = api.digest(MODELS[service], scene["frame"], prompt, seconds, *revision)
+    reference = [{"reference_image": scene["reference_image"]}] if scene.get("reference_image") else []
+    key = api.digest(MODELS[service], scene["frame"], prompt, seconds, *revision, *reference)
     return key, seconds, prompt
 
 
@@ -111,6 +115,8 @@ def attach_heygen(root, scene, source, task_id="", sent_prompt="", requested_sec
         details["requested_seconds"] = requested_seconds
     scene.update(video=target.name, video_seconds=actual, video_source=details,
                  task={"provider":"heygen", "key":key, "id":task_id, "state":"succeeded"})
+    for field in ("shot_plan","film_retry","film_retry_used","film_review"):
+        scene.pop(field,None)
 
 
 def animate(root, scene, service, notify, save):
@@ -141,12 +147,16 @@ def animate(root, scene, service, notify, save):
     def finish(target, task):
         scene.update(video=target.name, video_seconds=seconds, video_source={"provider":service, "model":model,
                      "id":task, "prompt":prompt, "requested_seconds":seconds, "input_frame":scene["frame"], "delivery":"api"})
+        if scene.get("reference_image"):
+            scene["video_source"]["reference_image"] = scene["reference_image"]
         checkpoint("succeeded", id=task)
     cached = root/"assets"/f"film-{key}.mp4"
     if journal.get("state")=="succeeded" and journal.get("id") and cached.is_file():
         finish(cached,journal["id"])
         return
     if journal.get("state") == "submitting":
+        if old.get("state") != "submitting" or old.get("key") != key:
+            checkpoint("submitting",id=journal.get("id",""))
         raise ValueError(f"{label} 的提交回执中断。请在本幕关联控制台任务号，或核对未受理后重提。")
     task = journal.get("id") if journal.get("state") != "failed" else None
     if not task:
@@ -154,8 +164,13 @@ def animate(root, scene, service, notify, save):
             raise ValueError("本机直连 HeyGen 需要用户变量 HEYGEN_API_KEY。已有 HeyGen 成片时可在本页选择场景并导入 MP4。")
         checkpoint("submitting", id="")
         try:
-            with Image.open(root / "assets" / scene["frame"]) as picture:
-                task = api.start_heygen(picture,prompt,seconds) if service=="heygen" else api.start_video(picture,prompt,seconds,auth)
+            with ExitStack() as images:
+                picture = images.enter_context(Image.open(root / "assets" / scene["frame"]))
+                references = {}
+                if scene.get("reference_image"):
+                    references["reference"] = images.enter_context(Image.open(root / "assets" / scene["reference_image"]))
+                task = (api.start_heygen(picture, prompt, seconds, **references) if service == "heygen" else
+                        api.start_video(picture, prompt, seconds, auth, **references))
         except Exception as error:
             if isinstance(error, api.ProviderRejected) or re.search(r"curl (6|7|35)\b|用户环境变量", str(error)):
                 checkpoint("failed", id="", message=str(error)[:280])
@@ -187,3 +202,65 @@ def animate(root, scene, service, notify, save):
             return
         time.sleep(10)
     raise RuntimeError(f"{label} 任务 {task} 仍在排队，点击同一生成按钮可继续查询。")
+
+
+def receipt(scene):
+    """Find the interrupted submission that can be linked to a console task."""
+    for shot in scene.get("shot_plan", []):
+        task = shot.get("task", {})
+        if task.get("state") == "submitting":
+            return task
+    return scene.get("task")
+
+
+def animate_scene(root, scene, service, notify, save):
+    """Render persisted shots one at a time and publish a distinct silent scene MP4."""
+    shots = scene.get("shot_plan")
+    if not shots:
+        return animate(root, scene, service, notify, save)
+    assets = root / "assets"
+    if scene.get("video") and (assets / scene["video"]).is_file():
+        return
+    if any(shot["provider"] != service or shot["frame"] != scene["frame"] for shot in shots):
+        raise ValueError("本幕已保存镜头计划。请沿用原动画服务和首帧，或重新生成本幕。")
+    old = scene.get("task") or {}
+    if old.get("state") in {"submitting", "pending"} and not any(
+            (slot.get("task") or {}).get("key") == old.get("key") for slot in shots):
+        raise ValueError("本幕另有待处理动画任务。请先恢复或核对原任务。")
+    for index, shot in enumerate(shots, 1):
+        if shot.get("video") and (assets / shot["video"]).is_file():
+            continue
+        if not shot.get("input_frame"):
+            shot["input_frame"] = cinema.continuation_frame(root,shots[index-2]) if index > 1 else shot["frame"]
+            save()
+        elif index > 1 and not (assets/shot["input_frame"]).is_file():
+            if cinema.continuation_frame(root,shots[index-2]) != shot["input_frame"]:
+                raise ValueError("续作镜头缺少原衔接帧。请核对前一镜头。")
+        draft = {"title": f"{scene['title']} · 镜头 {index}/{len(shots)}", "frame": shot["input_frame"],
+                 "planned_video_seconds": shot["duration"], "script": {"video_prompt": shot["prompt"]}}
+        if scene.get("animation_revision"):
+            draft["animation_revision"] = scene["animation_revision"]
+        if shot.get("reference_image"):
+            draft["reference_image"] = shot["reference_image"]
+        key, _, _ = render_recipe(draft, service)
+        if shot.get("task"):
+            draft["task"] = shot["task"]
+            journal = directory_record(root, service, key)
+            if draft["task"].get("key") == key and not journal.exists():
+                api.save_json(journal, draft["task"])
+
+        def checkpoint():
+            shot.update({field: draft[field] for field in ("task", "video", "video_seconds", "video_source")
+                         if field in draft})
+            scene["task"] = {**shot["task"], "shot_id": shot["id"]}
+            save()
+
+        animate(root, draft, service, notify, checkpoint)
+    target, seconds = cinema.compose(root, scene)
+    source = {"provider": service, "model": MODELS[service], "id": shots[-1]["task"]["id"], "delivery": "api",
+              "input_frame": scene["frame"], "cinematic": True,
+              "shots": [{**shot["video_source"], "shot_id": shot["id"], "file": shot["video"],
+                         "plot_ids": shot["plot_ids"], "start": shot["timeline_start"], "end": shot["timeline_end"]}
+                        for shot in shots]}
+    scene.update(video=target.name, video_seconds=seconds, video_source=source)
+    save()

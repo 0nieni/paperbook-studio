@@ -18,6 +18,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent
 SKILL = ROOT / "picturebook-studio" / "SKILL.md"
 DS = "deepseek-flash"
+OMNI = "qwen3.8-omni-flash"
 IMAGE = "qwen-image-2.0-pro"
 TTS = "qwen-audio-3.1-tts-flash"
 VIDEO = "MiniMax-H3"
@@ -131,7 +132,7 @@ def request(provider, url, body=None, timeout=210, *, attempts=5):
             continue
         err = obj.get("error") or ({"code":base_code,"message":base.get("status_msg")} if base_code else obj)
         why = str(err.get("message") or err.get("code") or "接口错误") if isinstance(err, dict) else str(err)
-        why = re.sub(r"https?://\S+|data:image/\S+|sk-[a-zA-Z0-9_-]+", "[已省略]", why.replace(key, "[已隐藏]"))
+        why = re.sub(r"https?://\S+|data:[^\s,]*;base64,\S+|sk-[a-zA-Z0-9_-]+", "[已省略]", why.replace(key, "[已隐藏]"))
         code = str(err.get("code") or "")[:40] if isinstance(err, dict) else ""
         message = f"{provider} HTTP {status.decode()} · {code} {why[:240]}".strip()
         if provider in {"MiniMax","MiniMax 订阅"} and code=="2068":
@@ -188,6 +189,31 @@ def ask(task, context, images=(), tokens=10000, *, system=None, timeout=210, att
         return result
     except (TypeError, ValueError, KeyError):
         raise ValueError("DeepSeek 未返回完整的 JSON 对象，可重试当前步骤。") from None
+
+
+def retell_video(clip):
+    encoded = base64.b64encode(clip).decode("ascii")
+    if len(encoded) >= 10_000_000:
+        raise ValueError("成片与配音的校验文件超过百炼本地视频输入大小。")
+    task = ("只根据这段成片的画面和实际声音，按时间复述本幕。分开记录眼睛能看到的动作与旁白实际说出的内容。"
+            "只有旁白提到的事件，visible 填空字符串。画面或声音不清楚时如实记载。"
+            '返回 {"retelling":"","events":[{"time":0.0,"visible":"","spoken":""}]}，时间单位为秒。')
+    result = request("千问",f"{bailian()}/compatible-mode/v1/chat/completions",{
+        "model":OMNI, "modalities":["text"], "stream":False, "reasoning_effort":"none",
+        "response_format":{"type":"json_object"}, "max_tokens":3500,
+        "messages":[{"role":"user","content":[
+            {"type":"video_url","video_url":{"url":"data:;base64,"+encoded}},
+            {"type":"text","text":task}
+        ]}]
+    },attempts=2)
+    try:
+        choice = result["choices"][0]
+        observation = json.loads(choice["message"]["content"])
+        if choice.get("finish_reason") == "length" or not isinstance(observation,dict):
+            raise ValueError
+        return observation
+    except (KeyError,IndexError,TypeError,ValueError):
+        raise ValueError("千问未返回完整的成片复述。") from None
 
 
 def edit_art(original, marked, target="", note=""):
@@ -264,11 +290,16 @@ def minimax_provider(auth):
     return "MiniMax 订阅" if auth=="subscription" else "MiniMax"
 
 
-def start_video(picture, prompt, seconds, auth="h3"):
+def start_video(picture, prompt, seconds, auth="h3", *, reference=None):
+    content = [{"type":"text","text":prompt},
+               {"type":"image_url","role":"first_frame","image_url":{"url":encode_image(picture)}}]
+    if reference is not None:
+        content[0]["text"] = "参考图1是本幕环境与开场构图，参考图2仅约束角色外观。不要把设定图排版或角色三视图画进场景。\n" + prompt
+        content[1]["role"] = "reference_image"
+        content.append({"type":"image_url","role":"reference_image","image_url":{"url":encode_image(reference)}})
     data = request(minimax_provider(auth), minimax_host() + "/v2/video_generation", {
-        "model": VIDEO, "resolution": "768P", "duration": seconds, "ratio": "adaptive",
-        "content": [{"type": "text", "text": prompt},
-                    {"type": "image_url", "role": "first_frame", "image_url": {"url": encode_image(picture)}}],
+        "model": VIDEO, "resolution": "768P", "duration": seconds,
+        "ratio": "adaptive" if reference is None else "16:9", "content":content, "generate_audio":False,
     })
     task = str(data.get("task_id") or data.get("task", {}).get("id") or "")
     if not re.fullmatch(r"[\w-]+", task):
@@ -283,14 +314,19 @@ def query_video(task_id, auth="h3"):
     return result.get("task", result)
 
 
-def start_heygen(picture, prompt, seconds):
+def start_heygen(picture, prompt, seconds, *, reference=None):
     # The desktop app can pass a local file; a standalone web server sends the first frame inline.
     encoded = encode_image(picture).split(",", 1)[1]
-    reply = request("HeyGen", HEYGEN_ENDPOINT, {
+    payload = {
         "model": HEYGEN, "mode": "image_to_video", "resolution": "768p", "duration": seconds,
         "prompt_enhancement": "quality", "prompt": prompt,
         "image": {"type": "base64", "media_type": "image/jpeg", "data": encoded},
-    })
+    }
+    if reference is not None:
+        cast = {"type":"base64","media_type":"image/jpeg","data":encode_image(reference).split(",",1)[1]}
+        payload.update(mode="reference_to_video",aspect_ratio="16:9",reference_images=[payload.pop("image"),cast],
+                       prompt="Use <Picture 1> for the scene and opening composition. Use <Picture 2> only for character identity. Do not show a character sheet or multi-view layout.\n"+prompt)
+    reply = request("HeyGen", HEYGEN_ENDPOINT, payload)
     record = reply.get("data") or reply
     task_id = str(record.get("video_id") or record.get("id") or "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", task_id):

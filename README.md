@@ -8,12 +8,13 @@
 - **绘本资料**查看评价、修改分镜和台词、重新生成单幕，并导出可离线打开的播放器。
 
 支持中文、英文和双语配音，以及暂停点选、随书问答与阅读小测。
+新建作品在导出前核对角色、情节、镜头运动和学习目标覆盖，并从实际视频末帧定位可点击物品。复核入口见使用说明。
 
 ## 在 Windows 上运行
 
 1. 安装 Python 3.10 或以上版本与 FFmpeg，将 `ffmpeg` 和 `ffprobe` 加入 PATH。
 2. 在项目目录运行 `python -m pip install -r requirements.txt`。
-3. 在 Windows 用户环境变量中配置 `deepseek_api`（分镜与文案）、`qwen`（绘图与语音）和 `minimax订阅`（MiniMax H3 动画）。
+3. 在 Windows 用户环境变量中配置 `deepseek_api`（分镜与文案）、`qwen`（绘图、语音和成片复述）和 `minimaxH3`（MiniMax H3 动画）。
 4. 双击 **启动绘本制作台.cmd**。也可以运行 `python -B server.py --open`，网页默认运行在本机 8765 端口。
 
 作品、导入的 PDF、生成素材和评价保存在本地的 `作品` 目录。录制与动画调用需要对应的服务权限和可用额度。

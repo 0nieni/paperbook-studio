@@ -113,6 +113,9 @@ def outline(root, book):
         pages.append({"n":n,"width":1280,"height":720,"text":"","objects":[]})
     book.update(profile=profile,scenes=scenes,layouts=layouts,pages=pages,regions=[],
                 pending_source_pdf=True,visual_version=VISUAL_VERSION)
+    # Keep the approved source outline independently of later scene edits.
+    from quality import capture_story
+    capture_story(book)
 
 
 def scene_prompt(root, book, index):
@@ -137,6 +140,11 @@ def scene_prompt(root, book, index):
 
     context = {"资料卡":book["profile"],"家长设定":book["creation"]["brief"],"当前幕":scene["id"],
                "故事大纲":[ed.scene_brief(s) for s in book["scenes"]],"其他已定画面设计":prior}
+    context["本幕情节节点"] = [n for n in book.get("plot_nodes",[]) if n["id"] in scene.get("plot_ids",[])]
+    if book.get("learning_goals"):
+        from learning import direction
+        context["本幕学习依据"] = direction(book,scene)
+        task += "\n在道具讲解和情节动作中落实相关学习目标，并把事实约束写入动画提示。"
     return ed.cached_ask(root,instructions.apply(task,book,"story","tts","image2video","interaction"),
                          context,[],VISUAL_VERSION,validate,5500)
 
@@ -175,21 +183,28 @@ class Compositions:
             return True
 
 
-def illustrate_scene(root, prompt, seen):
-    for attempt in ("", "\n另起新构图。严格按本幕机位和景别取景，把指定物品放在明显的位置。"):
-        key = api.digest(api.IMAGE,VISUAL_VERSION,"1280*720",prompt+attempt)
+def illustrate_scene(root, prompt, seen, *, reference=None, verify=None):
+    correction = ""
+    reference_id = api.digest(art.image_bytes(reference).hex()) if reference is not None else None
+    for attempt in range(2):
+        key = api.digest(api.IMAGE,VISUAL_VERSION,"1280*720",prompt+correction,*([reference_id] if reference_id else []))
         cached = root/"cache"/f"story-art-{key}.jpg"
         if cached.is_file():
             with Image.open(cached) as image:
                 picture = image.convert("RGB")
         else:
-            picture = api.illustrate(prompt+attempt)
+            picture = api.illustrate(prompt+correction,reference) if reference is not None else api.illustrate(prompt+correction)
+        issues = verify(picture) if verify else []
+        if issues and attempt == 0:
+            correction = "\n校验发现角色不一致。请参照角色设定图纠正：" + "；".join(issues)
+            continue
         thumbnail = composition(picture)
         if not seen.accept(thumbnail):
+            correction = "\n另起新构图。严格按本幕机位和景别取景，把指定物品放在明显的位置。"
             continue
         if not cached.is_file():
             api.atomic(cached,art.image_bytes(picture,"JPEG"))
-        return picture, cached.read_bytes(), thumbnail
+        return picture, cached.read_bytes(), thumbnail, issues
     raise ValueError("千问连续返回与前幕近乎相同的构图。请修改本幕环境或机位后继续制作。")
 
 
@@ -206,7 +221,7 @@ def generate(root, book, notice, redraw=False):
         notice(f"千问绘制插画 {n}/{len(drafts)} · {draft['title']}")
         prompt = instructions.apply(illustration_prompt(draft["visual"], profile["style"]),book,"text2image")
         try:
-            picture, data, thumbnail = illustrate_scene(root,prompt,seen)
+            picture, data, thumbnail, _ = illustrate_scene(root,prompt,seen)
         except ValueError as error:
             raise ValueError(f"「{draft['title']}」{error}") from error
         pictures.append(picture)

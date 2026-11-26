@@ -23,12 +23,14 @@ import editing
 import production
 import motion
 import providers
+import quality
 import reader_questions
 from rsi import evidence
 from rsi.service import StudioRSI
 
 HOME = Path(__file__).resolve().parent
-ACTIONS = {"import","analyze","clean","reclean","script","activities","voice","video","sample","all","export","proof","reel","build","redraw","redraw_scene","refresh_scene"}
+ACTIONS = {"import","analyze","clean","reclean","script","activities","voice","video","sample","all","export","proof",
+           "reel","build","redraw","redraw_scene","refresh_scene","review_film","approve_film"}
 
 
 class Studio:
@@ -73,7 +75,7 @@ class Studio:
             sid=body.get("scene","")
             if sid and sid not in {s["id"] for s in book["scenes"]}:
                 raise ValueError("场景不存在。")
-            if action in {"sample","refresh_scene","redraw_scene"} and not sid:
+            if action in {"sample","refresh_scene","redraw_scene","review_film","approve_film"} and not sid:
                 raise ValueError("请先选择要制作的分镜。")
             options = {}
             if action=="redraw_scene":
@@ -90,7 +92,7 @@ class Studio:
             if action=="refresh_scene" and body.get("use_minimax") is True:
                 book["video_provider"] = "minimax"
                 production.write(root,book)
-            if action not in {"import","export","proof","reel"} and not book.get("rsi_prompts"):
+            if action not in {"import","export","proof","reel","review_film","approve_film"} and not book.get("rsi_prompts"):
                 self.rsi.select(book)
                 production.write(root,book)
             edition_fields = ("edition","play_edition","proof_edition","sample_edition")
@@ -123,6 +125,10 @@ class Studio:
 
     def view(self,root):
         book=production.read(root)
+        for scene in book["scenes"]:
+            scene["film_review_current"] = bool(quality.current_review(root,book,scene))
+        if book.get("education_review"):
+            book["education_review_current"] = book["education_review"].get("key") == quality.education_key(book)
         book["coverage"]=production.coverage(book)
         book["pages"]=[{k:v for k,v in p.items() if k!="objects"} for p in book["pages"]]
         book["layouts"]=[{k:v for k,v in l.items() if k!="regions"} for l in book["layouts"]]
@@ -314,6 +320,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("场景不存在。")
                 motion.attach_heygen(root, scene, path, remote_id)
                 production.write(root, book)
+            if all(quality.inputs(book,scene)):
+                try:
+                    app.start(root,{"action":"review_film","scene":scene_id,"revision":book["revision"]})
+                except ValueError:
+                    # A concurrent edit/job can still pick up the saved clip at export.
+                    pass
             self.data(app.view(root))
         finally:
             path.unlink(missing_ok=True)

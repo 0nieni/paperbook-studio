@@ -9,6 +9,7 @@ from threading import Lock
 from PIL import Image
 
 import artwork as art
+import cast_check
 import editorial as ed
 import motion
 import original_story as story
@@ -18,16 +19,29 @@ from rsi import instructions
 
 
 def prepare_frame(root, context, scene, compositions):
+    enhanced = context.get("quality_version",1) >= 2
     if scene.get("needs_illustration"):
-        picture, data, _ = story.illustrate_scene(root,scene["art_prompt"],compositions)
+        def verify(picture):
+            return cast_check.check(root,context,scene,[("实际生成插画", picture)])
+
+        reference = cast_check.image(root,context,scene) if enhanced else None
+        prompt = scene["art_prompt"]
+        if enhanced:
+            prompt += "\n" + cast_check.direction(context,scene)
+        picture, data, _, issues = story.illustrate_scene(
+            root,prompt,compositions,reference=reference,verify=verify if enhanced else None)
         n = scene["parts"][0]["page"]
         api.atomic(art.pagefile(root,n),data)
         frame,_,_ = art.compose(root,scene,[])
         encoded = art.image_bytes(frame)
-        return {"frame":prod.artifact(root,"frame",encoded,"png"),"original":prod.artifact(root,"original",encoded,"png"),
-                "clean_review":[]}, picture.size
-    prod.clean(root,dict(context),scene)
-    fields = ("frame","original","clean_review","clean_approved","rsi_used")
+        result = {"frame":prod.artifact(root,"frame",encoded,"png"),"original":prod.artifact(root,"original",encoded,"png"),
+                  "clean_review":[]}
+        if enhanced:
+            result["visual"] = scene["visual"]
+            prod.record_frame_check(context,result,issues)
+        return result, picture.size
+    prod.clean_with_cast(root,dict(context),scene)
+    fields = ("frame","original","clean_review","clean_approved","rsi_used","frame_cast_review")
     return {k:scene[k] for k in fields if k in scene}, None
 
 
@@ -48,13 +62,17 @@ def prepare_script(root, context, beats, index, scene, designs):
 
 def run(root, book, scenes, languages, notice, *, frames_only=False):
     """The coordinator alone updates project.json. Workers handle detached scene snapshots."""
-    context = {k:book[k] for k in ("profile","pages","regions","creation","languages","voices","tts_model","rsi_prompts") if k in book}
+    prod.prepare_bible(root,book,notice)
+    context = {k:book[k] for k in ("profile","pages","regions","creation","languages","voices","tts_model",
+                                  "rsi_prompts","plot_nodes","quality_version","cast_reference","learning_goals") if k in book}
+    enhanced = book.get("quality_version",1) >= 2
     service = book.get("video_provider","heygen")
     video_limit = 1 if service == "heygen" else 3
     events = Queue()
     running = set()
     video_queue = deque()
     video_locks = {}
+    scheduled_video = set()
     errors = []
     video_failed = False
     compositions = story.Compositions()
@@ -87,10 +105,10 @@ def run(root, book, scenes, languages, notice, *, frames_only=False):
 
         def render(scene,draft,lock):
             def checkpoint():
-                fields = ("task","video","video_seconds","video_source")
+                fields = ("task","video","video_seconds","video_source","shot_plan")
                 events.put(("checkpoint",scene,None,{k:deepcopy(draft[k]) for k in fields if k in draft}))
             with lock:
-                motion.animate(root,draft,service,progress,checkpoint)
+                motion.animate_scene(root,draft,service,progress,checkpoint)
 
         video_active = 0
         def next_video():
@@ -99,23 +117,35 @@ def run(root, book, scenes, languages, notice, *, frames_only=False):
                 scene = video_queue.popleft()
                 draft = deepcopy(scene)
                 draft["script"] = draft.get("script") or draft["cue_plan"]
-                key,_,_ = motion.render_recipe(draft,service)
+                key = prod.animation_lock_key(draft,service)
                 submit("video","video",scene,render,scene,draft,video_locks.setdefault(key,Lock()))
                 video_active += 1
+
+        def queue_video(scene):
+            if frames_only or scene["id"] in scheduled_video or not has_frame(scene):
+                return
+            if scene.get("video") and (root/"assets"/scene["video"]).is_file():
+                return
+            if enhanced and (not scene.get("script") or not all(prod.quality.inputs(book,scene))):
+                return
+            previous = scene.get("frame_cast_review")
+            prod.review_frame(root,book,scene)
+            if previous != scene.get("frame_cast_review"):
+                prod.write(root,book)
+            if scene.get("clean_review") and not scene.get("clean_approved"):
+                raise ValueError("首帧仍有清图复核项，请核对后继续制作。")
+            if prod.plan_animation(root,book,scene,service):
+                prod.write(root,book)
+            scheduled_video.add(scene["id"])
+            video_queue.append(scene)
+            next_video()
 
         def frame_ready(scene):
             if frames_only:
                 return
-            if scene.get("clean_review") and not scene.get("clean_approved"):
-                raise ValueError("首帧仍有清图复核项，请核对后继续制作。")
-            if not (scene.get("video") and (root/"assets"/scene["video"]).is_file()):
-                # Pin the recipe before submission, even if a voice track arrives during polling.
-                if motion.pin_duration(scene,prod.languages(book)):
-                    prod.write(root,book)
-                video_queue.append(scene)
-                next_video()
             if scene.get("cue_plan"):
                 submit("spots","spots",scene,ed.locate_spots,root,context,deepcopy(scene))
+            queue_video(scene)
 
         def dispatch(scene):
             if not frames_only:
@@ -199,6 +229,8 @@ def run(root, book, scenes, languages, notice, *, frames_only=False):
                     prod.write(root,book)
                     if scene.get("script"):
                         explain(scene,lang)
+                    if enhanced:
+                        queue_video(scene)
                 elif stage == "spots":
                     scene["script"] = result
                     scene.pop("cue_plan")
@@ -206,6 +238,8 @@ def run(root, book, scenes, languages, notice, *, frames_only=False):
                     for language in languages:
                         if language in scene.get("narration",{}) and language not in scene.get("audio",{}):
                             explain(scene,language)
+                    if enhanced:
+                        queue_video(scene)
                 elif stage == "explain":
                     scene.setdefault("audio",{})[lang] = result
                     scene["narration"].pop(lang,None)
