@@ -55,6 +55,7 @@ class IntegrationTests(unittest.TestCase):
         self.model = ModelDouble()
         self.rsi = StudioRSI(self.data,self.model,background=False)
         self.book = production.initialize(self.root,"青蛙",{"kind":"text","languages":["zh"],"voices":{}})
+        self.book.pop("quality_version",None)
         image = Image.new("RGB",(96,54),"green")
         for i in (1,2):
             image.save(self.root/"pages"/f"p{i:04d}.jpg")

@@ -290,11 +290,16 @@ def minimax_provider(auth):
     return "MiniMax 订阅" if auth=="subscription" else "MiniMax"
 
 
-def start_video(picture, prompt, seconds, auth="h3"):
+def start_video(picture, prompt, seconds, auth="h3", *, reference=None):
+    content = [{"type":"text","text":prompt},
+               {"type":"image_url","role":"first_frame","image_url":{"url":encode_image(picture)}}]
+    if reference is not None:
+        content[0]["text"] = "参考图1是本幕环境与开场构图，参考图2仅约束角色外观。不要把设定图排版或角色三视图画进场景。\n" + prompt
+        content[1]["role"] = "reference_image"
+        content.append({"type":"image_url","role":"reference_image","image_url":{"url":encode_image(reference)}})
     data = request(minimax_provider(auth), minimax_host() + "/v2/video_generation", {
-        "model": VIDEO, "resolution": "768P", "duration": seconds, "ratio": "adaptive",
-        "content": [{"type": "text", "text": prompt},
-                    {"type": "image_url", "role": "first_frame", "image_url": {"url": encode_image(picture)}}],
+        "model": VIDEO, "resolution": "768P", "duration": seconds,
+        "ratio": "adaptive" if reference is None else "16:9", "content":content, "generate_audio":False,
     })
     task = str(data.get("task_id") or data.get("task", {}).get("id") or "")
     if not re.fullmatch(r"[\w-]+", task):
@@ -309,14 +314,19 @@ def query_video(task_id, auth="h3"):
     return result.get("task", result)
 
 
-def start_heygen(picture, prompt, seconds):
+def start_heygen(picture, prompt, seconds, *, reference=None):
     # The desktop app can pass a local file; a standalone web server sends the first frame inline.
     encoded = encode_image(picture).split(",", 1)[1]
-    reply = request("HeyGen", HEYGEN_ENDPOINT, {
+    payload = {
         "model": HEYGEN, "mode": "image_to_video", "resolution": "768p", "duration": seconds,
         "prompt_enhancement": "quality", "prompt": prompt,
         "image": {"type": "base64", "media_type": "image/jpeg", "data": encoded},
-    })
+    }
+    if reference is not None:
+        cast = {"type":"base64","media_type":"image/jpeg","data":encode_image(reference).split(",",1)[1]}
+        payload.update(mode="reference_to_video",aspect_ratio="16:9",reference_images=[payload.pop("image"),cast],
+                       prompt="Use <Picture 1> for the scene and opening composition. Use <Picture 2> only for character identity. Do not show a character sheet or multi-view layout.\n"+prompt)
+    reply = request("HeyGen", HEYGEN_ENDPOINT, payload)
     record = reply.get("data") or reply
     task_id = str(record.get("video_id") or record.get("id") or "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", task_id):

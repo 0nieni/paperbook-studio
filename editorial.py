@@ -307,6 +307,10 @@ def draft(root, book, i, before_frame=False):
     context["本幕情节节点"] = [n for n in book.get("plot_nodes",[]) if n["id"] in s.get("plot_ids",[])]
     images = []
     task = SCRIPT_TASK
+    if book.get("learning_goals"):
+        from learning import direction
+        context["本幕学习依据"] = direction(book,s)
+        task += "\n按本幕学习依据安排可见动作与道具讲解，事实约束必须写入动画导演稿。原文照录。"
     if before_frame:
         original,_,_ = art.compose(root,s,[])
         images.append(("按本幕裁切、拼接的原画，尺寸与最终首帧一致",original))
@@ -397,9 +401,18 @@ def make_activities(root, book):
         sc = s["script"]
         summaries.append({"id":s["id"],"pages":[p["page"] for p in s["parts"]],"title":sc["title"],
                           "summary":s["summary"], "lines":[{l:t[l] for l in ("id","role","sources","zh","en")} for t in sc["lines"]],
-                          "spots":[{"id":h["id"],"label":h["label"]} for h in sc["spots"]]})
+                          "plot_ids":s.get("plot_ids",[]),
+                          "spots":[{key:h[key] for key in ("id","label","explain") if key in h} for h in sc["spots"]]})
     task = ACTIVITY_TASK
     if book.get("creation"):
         task += "\n将学习目标与故事动作关联。FAQ 同时覆盖预设知识点和孩子可能提出的开放好奇问题，每条都给出可回看的情节线索。"
-    return cached_ask(root,instructions.apply(task,book,"interaction"),{"资料卡":book["profile"],"全书":summaries},[],0,
+    context = {"资料卡":book["profile"],"全书":summaries}
+    if book.get("learning_goals"):
+        from learning import activity_context
+        context["学习目标"] = activity_context(book)
+        task += "\n为每个学习目标安排一道能具体检验目标的小测，以该目标对应的原稿情节为证。保留六道题和原有题型，同一道题可据实覆盖多个相关目标。"
+    if book.get("education_feedback"):
+        context["上一版覆盖问题"] = book["education_feedback"]
+        task += "\n按原稿和可点击道具修正这些问题。"
+    return cached_ask(root,instructions.apply(task,book,"interaction"),context,[],0,
                       lambda x:activities(x,book["scenes"]),11000)

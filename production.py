@@ -15,7 +15,10 @@ import wave
 from PIL import Image
 
 import artwork as art
+import cast_check
+import cinema
 import editorial as ed
+import learning
 import providers as api
 import motion
 import original_story
@@ -33,7 +36,7 @@ def initialize(root, name, creation=None):
     book = {"id":root.name,"name":name,"revision":0,"pages":[],"profile":{"title":Path(name).stem},
             "scenes":[],"regions":[],"layouts":[],"activities":None,"faq_audio":{},"video_provider":"minimax","tts_model":api.TTS}
     if creation:
-        book.update(creation=creation, languages=creation["languages"], voices=creation["voices"])
+        book.update(creation=creation, languages=creation["languages"], voices=creation["voices"], quality_version=2)
     write(root,book)
     return book
 
@@ -136,8 +139,28 @@ def clear_script(scene):
 
 
 def clear_film_review(scene):
-    for key in ("film_review","film_retry","film_retry_used"):
+    for key in ("film_review","film_retry","film_retry_used","shot_plan"):
         scene.pop(key,None)
+
+
+def record_frame_check(book,scene,issues):
+    previous = scene.get("frame_cast_review",{}).get("issues",[])
+    scene["clean_review"] = list(dict.fromkeys([*(issue for issue in scene.get("clean_review",[]) if issue not in previous),*issues]))
+    scene["frame_cast_review"] = {"key":api.digest(scene["frame"],book.get("cast_reference"),scene.get("visual")),"issues":issues}
+    if issues:
+        scene.pop("clean_approved",None)
+
+
+def review_frame(root,book,scene):
+    if book.get("quality_version",1) < 2:
+        return []
+    key = api.digest(scene["frame"],book.get("cast_reference"),scene.get("visual"))
+    if scene.get("frame_cast_review",{}).get("key") == key:
+        return scene["frame_cast_review"]["issues"]
+    with Image.open(root/"assets"/scene["frame"]) as image:
+        issues = cast_check.check(root,book,scene,[("确认首帧",image.convert("RGB"))])
+    record_frame_check(book,scene,issues)
+    return issues
 
 
 def redraw_scene(root,book,sid,notice,note="",edited_prompt=None):
@@ -148,7 +171,6 @@ def redraw_scene(root,book,sid,notice,note="",edited_prompt=None):
         raise ValueError("本幕已有视频任务，请先核对任务结果，再重画首帧。")
     if scene.get("needs_illustration") or not all(art.pagefile(root,p["page"]).is_file() for p in scene["parts"]):
         raise ValueError("本幕原页尚未生成，请先完成原页插画。")
-
     original,_,_ = art.compose(root,scene,[])
     reference = original
     if scene.get("frame") and (root/"assets"/scene["frame"]).is_file():
@@ -164,8 +186,25 @@ def redraw_scene(root,book,sid,notice,note="",edited_prompt=None):
               "\n画面干净，保留道具细节，去除旁白、对话气泡和字幕。"
               f"\n请按家长确认的本幕提示词作画，其中本次修改优先：\n{design}")
     prompt = instructions.apply(prompt,book,"text2image")
+    if book.get("quality_version",1) >= 2:
+        prepare_bible(root,book,notice)
+        prompt += "\n" + cast_check.direction(book,scene)
+        cast = cast_check.image(root,book,scene) if book.get("creation",{}).get("kind") == "text" else None
+        if cast is not None:
+            canvas = Image.new("RGB",(reference.width+cast.width,max(reference.height,cast.height)),"white")
+            canvas.paste(reference,(0,0))
+            canvas.paste(cast,(reference.width,0))
+            reference = canvas
+            prompt += "\n参考附件左侧用于场景和构图，右侧用于角色设定。"
     notice(f"千问正在重画「{scene['title']}」")
     picture = api.illustrate(prompt,reference)
+    cast_issues = []
+    if book.get("quality_version",1) >= 2:
+        cast_issues = cast_check.check(root,book,scene,[("重画首帧",picture)])
+        if cast_issues:
+            prompt += "\n首帧复核指出：" + "；".join(cast_issues)
+            picture = api.illustrate(prompt,reference)
+            cast_issues = cast_check.check(root,book,scene,[("重画首帧",picture)])
     frame = artifact(root,"frame",art.image_bytes(picture),"png")
     source = artifact(root,"original",art.image_bytes(original),"png")
     plan = scene.get("script") or scene.get("cue_plan") or {}
@@ -182,6 +221,8 @@ def redraw_scene(root,book,sid,notice,note="",edited_prompt=None):
                  redraw_edit={"id":uuid.uuid4().hex,"scene":sid,"title":scene["title"],"before":previous,
                               "after":design,"note":note,"sent":prompt,"frame":frame})
     scene.pop("clean_approved",None)
+    if book.get("quality_version",1) >= 2:
+        record_frame_check(book,scene,cast_issues)
     instructions.stamp(scene,book,"text2image")
     write(root,book)
 
@@ -344,23 +385,25 @@ def faq_speech(root,book,langs,notice,save):
 
 def animate_book(root, book, scenes, notice):
     unfinished = [scene for scene in scenes if not scene.get("video") or not (root/"assets"/scene["video"]).is_file()]
+    service = book.get("video_provider", "heygen")
     for scene in unfinished:
         if not scene.get("frame") or not scene.get("script"):
             raise ValueError(f"请先完成「{scene['title']}」的首帧和动作提示。")
+        review_frame(root,book,scene)
         if scene.get("clean_review") and not scene.get("clean_approved"):
+            write(root,book)
             raise ValueError(f"请先核对「{scene['title']}」的清图对照。")
-        motion.pin_duration(scene,languages(book))
+        plan_animation(root,book,scene,service)
     if not unfinished:
         return
     write(root,book)
-    service = book.get("video_provider", "heygen")
     lock = Lock()
-    recipe_locks = {motion.render_recipe(s,service)[0]:Lock() for s in unfinished}
+    recipe_locks = {animation_lock_key(s,service):Lock() for s in unfinished}
     def render(scene):
         draft = deepcopy(scene)
         def checkpoint():
             with lock:
-                for field in ("task", "video", "video_seconds", "video_source"):
+                for field in ("task", "video", "video_seconds", "video_source", "shot_plan"):
                     if field in draft:
                         scene[field] = deepcopy(draft[field])
                 write(root, book)
@@ -368,9 +411,9 @@ def animate_book(root, book, scenes, notice):
             with lock:
                 count = sum(bool(s.get("video")) for s in scenes)
                 notice(f"已完成 {count}/{len(scenes)} 幕 · {message}")
-        key, _, _ = motion.render_recipe(draft,service)
+        key = animation_lock_key(draft,service)
         with recipe_locks[key]:
-            motion.animate(root, draft, service, progress, checkpoint)
+            motion.animate_scene(root, draft, service, progress, checkpoint)
             checkpoint()
     remaining = iter(unfinished)
     workers = 1 if service == "heygen" else 3
@@ -388,7 +431,8 @@ def animate_book(root, book, scenes, notice):
 
 def recover(root,book,sid,task):
     s = next((s for s in book["scenes"] if s["id"]==sid),None)
-    receipt = (s.get("film_retry",{}).get("task") or s.get("task")) if s else None
+    target = s.get("film_retry") or s if s else {}
+    receipt = motion.receipt(target)
     if not receipt or receipt["state"]!="submitting":
         raise ValueError("这幕没有待恢复的提交。")
     if task and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}",task):
@@ -400,6 +444,8 @@ def recover(root,book,sid,task):
         journal["auth"] = receipt["auth"]
     api.save_json(motion.directory_record(root,service,receipt["key"]),journal)
     receipt.update(journal)
+    if target.get("task",{}).get("key") == receipt["key"]:
+        target["task"].update(journal)
     write(root,book)
 
 
@@ -408,6 +454,59 @@ def prepare_plot(root,book,notice):
     quality.prepare_plot(root,book,notice)
     if before != (book["plot_nodes"],[s["plot_ids"] for s in book["scenes"]]):
         write(root,book)
+
+
+def prepare_bible(root,book,notice):
+    prepare_plot(root,book,notice)
+    if book.get("quality_version",1) < 2:
+        return
+    before = api.digest(book.get("cast_reference"),book.get("learning_goals"))
+    cast_check.prepare(root,book,notice)
+    learning.prepare(root,book,notice)
+    if before != api.digest(book.get("cast_reference"),book.get("learning_goals")):
+        write(root,book)
+
+
+def clean_with_cast(root,book,scene,force=False):
+    clean(root,book,scene,force)
+    if force:
+        scene.pop("frame_cast_review",None)
+    issues = review_frame(root,book,scene)
+    if issues and not force and not scene.get("clean_approved"):
+        clean(root,book,scene,force=True)
+        scene.pop("frame_cast_review",None)
+        review_frame(root,book,scene)
+
+
+def plan_animation(root,book,scene,service):
+    if (book.get("quality_version",1) < 2 or
+            not scene.get("shot_plan") and scene.get("task",{}).get("state") in {"pending","submitting"}):
+        return motion.pin_duration(scene,languages(book))
+    if scene.get("shot_plan"):
+        return False
+    if not all(quality.inputs(book,scene)):
+        raise ValueError(f"请先完成「{scene['title']}」各所选语言的朗读，再按实测时长安排镜头。")
+    prompt = scene["script"]["video_prompt"] + "\n" + cast_check.direction(book,scene)
+    facts = learning.direction(book,scene)
+    if facts:
+        prompt += "\n延续以下审定的教学依据和事实约束：" + json.dumps(facts,ensure_ascii=False)
+    draft = {**scene,"script":{**scene["script"],"video_prompt":prompt}}
+    slots = cinema.plan(root,book,draft,service,languages(book))
+    if book.get("creation",{}).get("kind") == "text":
+        reference = cast_check.image(root,book,scene)
+        if reference is not None:
+            asset = artifact(root,"cast-video",art.image_bytes(reference),"png")
+            for slot in slots:
+                slot["reference_image"] = asset
+    scene["shot_plan"] = slots
+    return True
+
+
+def animation_lock_key(scene,service):
+    if scene.get("shot_plan"):
+        return api.digest(service,[(shot["frame"],shot["prompt"],shot.get("reference_image"))
+                                   for shot in scene["shot_plan"]],scene.get("animation_revision"))
+    return motion.render_recipe(scene,service)[0]
 
 
 def review_spot_audio(root,book,scene,review):
@@ -425,7 +524,7 @@ def review_films(root,book,scenes,notice,*,retry=False,force=False,required=Fals
     candidates = [s for s in scenes if s.get("video") and (root/"assets"/s["video"]).is_file()]
     if not candidates and not required:
         return []
-    prepare_plot(root,book,notice)
+    prepare_bible(root,book,notice)
     errors = []
     for scene in scenes if required else candidates:
         title = scene["title"]
@@ -438,7 +537,7 @@ def review_films(root,book,scenes,notice,*,retry=False,force=False,required=Fals
                 continue
             if quality.accepted(root,book,scene) and not force:
                 continue
-            notice(f"校验成片末帧与情节 · {title}")
+            notice(f"校验成片 · {title}")
             review = quality.current_review(root,book,scene) or {}
             if not scene.get("film_retry") and (
                     force or review.get("key") != quality.review_key(book,scene) or review.get("state") != "needs_review"):
@@ -451,6 +550,11 @@ def review_films(root,book,scenes,notice,*,retry=False,force=False,required=Fals
                     (scene.get("video_source") or {}).get("delivery") == "api"):
                 prompt = scene["script"]["video_prompt"] + "\n复核发现：" + "；".join(review["issues"])
                 prompt += "\n完整呈现本幕关键动作，末帧停稳并清楚保留关键道具。"
+                motion_issues = review.get("motion",{}).get("issues",[])
+                if any("动作过少" in note for note in motion_issues):
+                    prompt += "\n让相应镜头的主体动作明显展开，呈现预备、身体或道具移位和余势，环境轻晃仅作为辅助。"
+                if any("跳变过大" in note for note in motion_issues):
+                    prompt += "\n减小相应镜头的位移幅度，保持五官和轮廓稳定，镜头平稳跟随并避免突跳和闪烁。"
                 scene["film_retry"] = {"revision":uuid.uuid4().hex,"task":{},"prompt":prompt}
                 scene["film_retry_used"] = True
                 write(root,book)
@@ -458,23 +562,33 @@ def review_films(root,book,scenes,notice,*,retry=False,force=False,required=Fals
                 pending = scene["film_retry"]
                 draft = {**deepcopy(scene),"animation_revision":pending["revision"],"task":pending["task"]}
                 draft.pop("video",None)
+                draft.pop("shot_plan",None)
+                if pending.get("shot_plan"):
+                    draft["shot_plan"] = deepcopy(pending["shot_plan"])
                 draft["script"]["video_prompt"] = pending["prompt"]
                 service = scene["video_source"]["provider"]
+                if plan_animation(root,book,draft,service) and draft.get("shot_plan"):
+                    pending["shot_plan"] = deepcopy(draft["shot_plan"])
+                    write(root,book)
 
                 def checkpoint():
                     pending["task"] = draft["task"]
+                    if draft.get("shot_plan"):
+                        pending["shot_plan"] = deepcopy(draft["shot_plan"])
                     write(root,book)
 
                 notice(f"按成片校验结果重生成一次 · {title}")
                 try:
-                    motion.animate(root,draft,service,notice,checkpoint)
+                    motion.animate_scene(root,draft,service,notice,checkpoint)
                 except (RuntimeError,ValueError,OSError):
-                    if pending["task"].get("state") not in {"pending","submitting"}:
+                    status = pending["task"].get("state")
+                    if status == "failed" or (not pending.get("shot_plan") and status not in {"pending","submitting"}):
                         scene.pop("film_retry",None)
                         write(root,book)
                     raise
-                for field in ("video","video_seconds","video_source","task","animation_revision"):
-                    scene[field] = draft[field]
+                for field in ("video","video_seconds","video_source","task","animation_revision","shot_plan"):
+                    if field in draft:
+                        scene[field] = draft[field]
                 scene.pop("film_retry",None)
                 scene.pop("film_review",None)
                 write(root,book)
@@ -502,6 +616,40 @@ def observation_available(root,book):
         return False
     spots = scene["film_review"]["spots"] if quality.accepted(root,book,scene) else scene["script"]["spots"]
     return any(h["id"] == ob["spot"] for h in spots)
+
+
+def activity_scenes(root,book,verified_only=False):
+    result = []
+    for scene in book["scenes"]:
+        script = scene["script"]
+        if quality.accepted(root,book,scene):
+            spots = scene["film_review"]["spots"]
+        else:
+            spots = [] if verified_only else script["spots"]
+        result.append({**scene,"script":{**script,"spots":spots}})
+    return result
+
+
+def review_education(root,book,notice):
+    if book.get("quality_version",1) < 2:
+        return
+    notice("核对每个学习目标的情节、可点击道具和小测")
+    scenes = activity_scenes(root,book,verified_only=True)
+    report = learning.cover(root,book,scenes,book["activities"])
+    if report["state"] != "passed" and book.get("education_repair") != quality.education_key(book):
+        diagnosis = report["issues"]
+        if any(row.get("hotspots") and not row.get("quiz_indices") for row in report["goals"]):
+            candidate = ed.make_activities(root,{**book,"scenes":scenes,"education_feedback":diagnosis})
+            revised = learning.cover(root,book,scenes,candidate)
+            if revised["state"] == "passed" or len(revised["issues"]) < len(report["issues"]):
+                book.update(activities=candidate,faq_audio={})
+                report = revised
+        book["education_repair"] = quality.education_key(book)
+    report["key"] = quality.education_key(book)
+    book["education_review"] = report
+    write(root,book)
+    if report["state"] != "passed":
+        raise ValueError("学习目标待补齐 · " + " / ".join(report["issues"]))
 
 
 def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
@@ -598,6 +746,8 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
         if (not sid or not review or review["state"] != "needs_review" or not review["spots"] or
                 scene.get("film_retry")):
             raise ValueError("本幕需要先校验当前成片，并至少保留一个已验证的可点物品。")
+        if review.get("learning_issues"):
+            raise ValueError("请修正成片中的教学事实并重新校验，再导出正式版本。")
         review_spot_audio(root,book,scene,review)
         review["state"] = "approved"
         save()
@@ -623,10 +773,7 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
                 book["activities"] = None
                 book["faq_audio"] = {}
             if not book.get("activities"):
-                activity_book = {**book,"scenes":[
-                    {**s,"script":{**s["script"],"spots":s["film_review"]["spots"]}}
-                    if quality.accepted(root,book,s) else s for s in book["scenes"]
-                ]}
+                activity_book = {**book,"scenes":activity_scenes(root,book)}
                 book["activities"]=ed.make_activities(root,activity_book)
                 save()
             continue
@@ -654,6 +801,8 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
                     raise RuntimeError(" / ".join(errors))
                 if not sid and not observation_available(root,book):
                     make(root,book,"activities","","",notice)
+                if not sid:
+                    review_education(root,book,notice)
                     faq_speech(root,book,enabled,notice,save)
             edition = publish(root,book,scenes,partial=bool(sid),proof=step=="proof")
             book["proof_edition" if step=="proof" else ("sample_edition" if sid else "edition")]=edition
@@ -662,7 +811,7 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
             save()
             continue
         if step=="video" and len(scenes)>1:
-            prepare_plot(root,book,notice)
+            prepare_bible(root,book,notice)
             animate_book(root,book,scenes,notice)
             errors = review_films(root,book,scenes,notice,retry=True)
             if errors:
@@ -671,7 +820,8 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
         for i,s in enumerate(scenes,1):
             notice(f"{i}/{len(scenes)} · {s['title']}")
             if step in {"clean","reclean"}:
-                clean(root,book,s,step=="reclean")
+                prepare_bible(root,book,notice)
+                clean_with_cast(root,book,s,step=="reclean")
                 if action in {"all","sample"} and s.get("clean_review") and not s.get("clean_approved"):
                     save()
                     raise ValueError(f"「{s['title']}」仍有清图复核项，请到“清图与台词”查看对应位置。")
@@ -679,7 +829,7 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
                 if not s.get("frame"):
                     raise ValueError(f"请先清理「{s['title']}」的首帧。")
                 if not s.get("script"):
-                    prepare_plot(root,book,notice)
+                    prepare_bible(root,book,notice)
                     s["script"] = ed.locate_spots(root,book,s) if s.get("cue_plan") else ed.draft(root,book,book["scenes"].index(s))
                     s.pop("cue_plan",None)
                     instructions.stamp(s,book,"tts","image2video","interaction")
@@ -693,12 +843,15 @@ def make(root,book,action,sid,lang,notice,*,redraw_note="",redraw_prompt=None):
             elif step=="video":
                 if not s.get("frame") or not s.get("script"):
                     raise ValueError("请先完成本幕首帧和动作提示。")
+                prepare_bible(root,book,notice)
+                review_frame(root,book,s)
                 if s.get("clean_review") and not s.get("clean_approved"):
-                    raise ValueError(f"请先在清图对照中核对「{s['title']}」的残留标记。")
-                prepare_plot(root,book,notice)
-                if motion.pin_duration(s,enabled):
                     save()
-                motion.animate(root,s,book.get("video_provider","heygen"),notice,save)
+                    raise ValueError(f"请先在清图对照中核对「{s['title']}」的残留标记。")
+                service = book.get("video_provider","heygen")
+                if plan_animation(root,book,s,service):
+                    save()
+                motion.animate_scene(root,s,service,notice,save)
             else:
                 raise ValueError("未知的制作步骤。")
             save()

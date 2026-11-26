@@ -127,6 +127,8 @@ class Studio:
         book=production.read(root)
         for scene in book["scenes"]:
             scene["film_review_current"] = bool(quality.current_review(root,book,scene))
+        if book.get("education_review"):
+            book["education_review_current"] = book["education_review"].get("key") == quality.education_key(book)
         book["coverage"]=production.coverage(book)
         book["pages"]=[{k:v for k,v in p.items() if k!="objects"} for p in book["pages"]]
         book["layouts"]=[{k:v for k,v in l.items() if k!="regions"} for l in book["layouts"]]

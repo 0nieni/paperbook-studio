@@ -226,6 +226,19 @@ function profile(view){
  const chars=node("section","editor");append(chars,head("角色与角度参考"));for(const c of (p.characters||[])){
  const row=node("div","role");append(row,field("角色",c.name,v=>c.name=v),field("固定外观",c.features,v=>c.features=v,true),node("small","",(c.refs||[]).map(r=>"第 "+r.page+" 页 "+r.view).join(" / ")));chars.append(row);}
  if(b.reference){const img=node("img","ref");img.src=media("assets",b.reference);img.alt="从原画提取的角色角度参考";chars.append(img);}
+ for(const c of b.cast_reference?.characters||[]){
+   const row=append(node("div","role"),node("h3","",c.name+"的角色设定"));
+   const traits=[...c.traits,...Object.entries(c.palette).map(([part,color])=>part+" "+color)];
+   if(traits.length)row.append(node("p","hint",traits.join(" · ")));
+   for(const ref of c.refs){
+     const img=node("img","ref");img.src=media("assets",ref.asset);img.loading="lazy";
+     const names={front:"正面",side:"侧面",back:"背面",turnaround:"正侧背参考",unknown:"原画参考"};
+     img.alt=c.name+" · "+(names[ref.view]||ref.view)+(ref.page?" · 原书第 "+ref.page+" 页":"");
+     row.append(img);
+   }
+   if(c.missing_views.length)row.append(node("p","hint","缺少原书角度 · "+c.missing_views.map(v=>({front:"正面",side:"侧面",back:"背面"}[v]||v)).join("、")));
+   chars.append(row);
+ }
  view.append(chars);
 }
 function scripts(view){
@@ -289,6 +302,14 @@ function output(view){
      }
      review.append(append(node("div","paper"),frame,overlay));
      if(film.issues.length)review.append(append(node("ul","check-list"),...film.issues.map(issue=>node("li","",issue))));
+     if(film.motion?.shots.length){
+       const metrics=node("ul","check-list");
+       for(const [i,shot] of film.motion.shots.entries()){
+         const plan=s.shot_plan?.find(slot=>slot.id===shot.id);
+         metrics.append(node("li","",`镜头 ${i+1}${plan?" · "+plan.framing:""} · ${shot.seconds} 秒 · 峰值位移 ${shot.peak_motion} · 有运动 ${Math.round(shot.active_fraction*100)}%`));
+       }
+       review.append(append(node("details"),node("summary","","逐镜头运动量"),metrics));
+     }
      for(const [lang,result] of Object.entries(film.observations||{})){
        review.append(append(node("details"),node("summary","",lang==="zh"?"中文成片复述":"英文成片复述"),
                             node("p","",result.retelling)));
@@ -297,13 +318,28 @@ function output(view){
    const clip=node("video");clip.src=media("assets",s.video);clip.controls=true;clip.preload="none";
    review.append(append(node("details"),node("summary","","预览本幕静音成片"),clip));
    const buttons=append(node("div","actions"),jobButton(s.film_retry?"继续自动重生成":"校验本幕成片","review_film",s.id));
-   if(film?.state==="needs_review" && film.spots.length && !s.film_retry){
+   if(film?.state==="needs_review" && film.spots.length && !film.learning_issues?.length && !s.film_retry){
      const approve=action("复核后采用本幕",()=>{
-       if(confirm("确认已核对成片中的情节与顺序，采用这段动画？"))return job("approve_film",s.id);
+       if(confirm("确认已逐项核对列出的成片问题，采用这段动画？"))return job("approve_film",s.id);
      });
      approve.disabled=busy();buttons.append(approve);
    }
    sec.append(append(review,buttons));
+ }
+ if(b.learning_goals?.length){
+   const panel=append(node("section","editor"),head("学习目标覆盖"));
+   const report=b.education_review_current?b.education_review:null;
+   panel.append(node("p","hint",report?.state==="passed"?"各目标已找到情节、已校验热点和小测":"等待正式导出核对"));
+   for(const goal of b.learning_goals){
+     const result=report?.goals.find(g=>g.id===goal.id);
+     const row=append(node("div","role"),node("h3","",goal.text));
+     if(result){
+       row.append(node("p","hint",`原稿情节 ${result.plot_ids.length} 项 · 已校验热点 ${result.hotspots.length} 项 · 小测 ${result.quiz_indices.length} 道`));
+       if(result.issues.length)row.append(append(node("ul","check-list"),...result.issues.map(issue=>node("li","",issue))));
+     }
+     panel.append(row);
+   }
+   sec.append(panel);
  }
  if(provider==="heygen" && s.frame && s.script){
    const exchange=node("section","editor");exchange.append(head("用 HeyGen 制作本幕"));

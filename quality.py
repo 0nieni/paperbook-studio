@@ -9,7 +9,10 @@ from tempfile import TemporaryDirectory
 from PIL import Image
 
 import artwork as art
+import cast_check
+import cinema
 import editorial as ed
+import learning
 import providers as api
 
 
@@ -118,9 +121,18 @@ def inputs(book, scene):
 
 
 def review_key(book, scene):
-    return api.digest("film-review-2",api.OMNI,scene.get("video"),scene.get("frame"),scene["parts"],
+    enhanced = book.get("quality_version",1) >= 2
+    rules = [book.get("cast_reference"),learning.direction(book,scene),scene.get("shot_plan"),scene.get("visual")] if enhanced else []
+    return api.digest("film-review-3" if enhanced else "film-review-2",api.OMNI,scene.get("video"),scene.get("frame"),scene["parts"],
                       scene.get("script"),scene_nodes(book,scene),
-                      [(track["file"],track["duration"]) if track else None for track in inputs(book,scene)])
+                      [(track["file"],track["duration"]) if track else None for track in inputs(book,scene)],*rules)
+
+
+def education_key(book):
+    return api.digest(book.get("learning_goals"),book.get("activities"),[
+        [s["id"],s.get("plot_ids"),s.get("video"),s.get("film_review"),(s.get("script") or {}).get("lines")]
+        for s in book["scenes"]
+    ])
 
 
 def accepted(root, book, scene):
@@ -167,14 +179,15 @@ def final_frame(video, seconds):
         return image.convert("RGB"), result.stdout
 
 
-def with_narration(video, audio, video_seconds, audio_seconds):
+def with_narration(video, audio, video_seconds, audio_seconds, *, cinematic=False):
     # The player ends the scene with the narration, even if a clip is longer.
-    rate = max(.25,min(2,video_seconds/audio_seconds))
+    rate = 1 if cinematic else max(.25,min(2,video_seconds/audio_seconds))
+    seconds = max(video_seconds,audio_seconds) if cinematic else audio_seconds
     with TemporaryDirectory() as directory:
         output = Path(directory)/"review.mp4"
         result = api.run_binary(["ffmpeg","-nostdin","-loglevel","error","-xerror","-i",str(video),"-i",str(audio),
-                                 "-map","0:v:0","-map","1:a:0","-t",str(audio_seconds),
-                                 "-vf",f"setpts=PTS/{rate},fps=12,scale=640:-2,tpad=stop_mode=clone:stop_duration={audio_seconds}",
+                                 "-map","0:v:0","-map","1:a:0","-t",str(seconds),"-af","apad",
+                                 "-vf",f"setpts=PTS/{rate},fps=12,scale=640:-2,tpad=stop_mode=clone:stop_duration={seconds}",
                                  "-c:v","libx264","-pix_fmt","yuv420p","-maxrate","480k","-bufsize","960k",
                                  "-c:a","aac","-b:a","40k","-movflags","+faststart",str(output)],
                                 capture_output=True,timeout=120)
@@ -197,7 +210,8 @@ def verify_spots(root, book, scene, picture):
 "source":{"part":1,"box":[0,0,1,1]}}}。非 PDF 省略 source。"""
     labels = [{"id":sid,"label":spot["label"]} for sid,spot in expected.items()]
     located = api.ask(task,{"成片候选物品":labels,"本幕原稿情节":scene_nodes(book,scene),
-                           "计划画面道具":scene.get("visual",{}).get("props",[])},images,3000)
+                           "计划画面道具":scene.get("visual",{}).get("props",[]),
+                           "本幕学习目标":learning.direction(book,scene)},images,3000)
     if not isinstance(located["spots"],list) or any(not isinstance(h,dict) for h in located["spots"]):
         raise ValueError("成片热点定位结果格式有误。")
     candidates = [h for h in located["spots"] if h.get("id") in expected]
@@ -292,13 +306,30 @@ def evaluate(root, book, scene):
     tracks = inputs(book,scene)
     observations = {}
     issues = []
+    evidence = {}
+    enhanced = book.get("quality_version",1) >= 2
+    cinematic = enhanced
+    if enhanced:
+        report = cinema.motion_report(root,scene)
+        issues.extend(report["issues"])
+        frames = list(cinema.sample_frames(root,scene))
+        cast_issues = cast_check.check(root,book,scene,frames)
+        issues.extend(cast_issues)
+        evidence.update(motion=report,cast_issues=cast_issues)
+        if (scene.get("video_source") or {}).get("cinematic") and length+.75 < max(track["duration"] for track in tracks):
+            issues.append("镜头长度不足以承载最长语种朗读，请增加镜头。")
     for lang, track in zip(book.get("languages") or ["zh","en"],tracks):
-        clip = with_narration(video,root/"assets"/track["file"],length,track["duration"])
+        clip = with_narration(video,root/"assets"/track["file"],length,track["duration"],cinematic=cinematic)
         observation = api.retell_video(clip)
         observations[lang] = observation
         prefix = "中文 · " if lang == "zh" else "英文 · "
-        issues.extend(prefix+issue for issue in verify_plot(nodes,observation,track["duration"]+.10))
+        playback = max(length,track["duration"]) if cinematic else track["duration"]
+        issues.extend(prefix+issue for issue in verify_plot(nodes,observation,playback+.10))
+    if enhanced:
+        factual_issues = learning.check_film(root,book,scene,observations,frames=frames)
+        issues.extend(factual_issues)
+        evidence["learning_issues"] = factual_issues
     if scene["script"]["spots"] and not spots:
         issues.append("成片末帧没有通过裁图校验的可点物品。")
     return {"state":"needs_review" if issues else "passed","key":review_key(book,scene),"video":scene["video"],
-            "frame":frame,"spots":spots,"issues":issues,"observations":observations}
+            "frame":frame,"spots":spots,"issues":issues,"observations":observations,**evidence}

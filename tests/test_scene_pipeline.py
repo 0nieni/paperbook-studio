@@ -32,6 +32,16 @@ def manuscript(i, sources=()):
 
 
 class FilmProviderTests(unittest.TestCase):
+    def test_minimax_separates_story_frame_and_cast_in_reference_mode(self):
+        frame = Image.new("RGB",(1280,720),"green")
+        cast = Image.new("RGB",(1280,720),"orange")
+        with patch.object(providers,"request",return_value={"task_id":"clip-1"}) as request:
+            self.assertEqual(providers.start_video(frame,"The bear waves.",4,reference=cast),"clip-1")
+        payload = request.call_args.args[2]
+        self.assertEqual([image["role"] for image in payload["content"][1:]],["reference_image","reference_image"])
+        self.assertEqual(payload["ratio"],"16:9")
+        self.assertNotEqual(payload["content"][1]["image_url"],payload["content"][2]["image_url"])
+
     def test_retelling_uses_existing_bailian_endpoint_and_embeds_video(self):
         response = {"choices":[{"message":{"content":'{"retelling":"test","events":[]}'}}]}
         with patch.object(providers,"bailian",return_value="https://dashscope.aliyuncs.com"), \
@@ -52,6 +62,7 @@ class PipelineTests(unittest.TestCase):
         self.calls = Counter()
         self.started = {name:Event() for name in ("plan2","image1","voice1","video1","video2")}
         self.overlap = False
+        self.enhanced = False
         self.interrupt = False
         self.fail_frame = 0
         self.writers = None
@@ -75,11 +86,34 @@ class PipelineTests(unittest.TestCase):
         stack.enter_context(patch.object(providers,"fetch_media",return_value=self.clip.read_bytes()))
 
     def ask(self,task,ctx,images,tokens):
+        if "角色定型" in ctx:
+            return {"characters":[{"name":p["name"],"palette":{"帽子":"#3355AA"},
+                                    "traits":["圆耳朵","星形徽章"]} for p in ctx["角色定型"]]}
+        if "角色三视图核对" in ctx:
+            return {"views":{"front":"正面圆耳朵","side":"侧面蓝帽子","back":"背面星形徽章"},
+                    "matches":True,"issues":[]}
+        if "角色一致性检查" in ctx:
+            return {"frames":[{"label":label,"characters":[{"name":p["name"],"status":"match",
+                        "evidence":"蓝色帽子与圆耳朵一致"} for p in ctx["角色一致性检查"]]}
+                       for label in ctx["实际帧标签"]]}
+        if "教学目标原文" in ctx:
+            node = ctx["原稿情节节点"][0]["id"]
+            return {"goals":[{"id":g["id"],"relations":[{"plot_id":node,"reason":"观察第一颗星"}],
+                              "facts":[]} for g in ctx["教学目标原文"]]}
+        if "教学目标覆盖核对" in ctx:
+            source = ctx["场景证据"][0]
+            node = source["plot_ids"][0]
+            return {"matches":[{"id":g["id"],"hotspots":[{"scene":source["id"],"spot":source["spots"][0]["id"],
+                                  "plot_id":node,"reason":"通过道具观察星星"}],
+                               "quizzes":[{"scene":source["id"],"index":1,"plot_id":node,
+                                           "quote":"看第1颗星。","reason":"题目检验观察结果"}]}
+                              for g in ctx["教学目标覆盖核对"]]}
         if "情节原稿" in ctx:
             return {"events":[{"action":ctx["情节原稿"]["summary"],"cause":"","result":"","part":1,
                                "box":[.2,.2,.4,.4],"sources":[]}]}
         if "成片候选物品" in ctx:
-            self.assertGreater(images[0][1].getpixel((640,360))[0],200)
+            if not self.enhanced:
+                self.assertGreater(images[0][1].getpixel((640,360))[0],200)
             if self.replacement_hotspot:
                 return {"spots":[],"replacement":{"box":[.65,.5,.80,.75],"label":pair("红灯"),"explain":pair("红色的灯")}}
             return {"spots":[{"id":h["id"],"box":[.65,.5,.80,.75],
@@ -141,7 +175,11 @@ class PipelineTests(unittest.TestCase):
         self.retold_seconds.append(round(float(probe.stdout.strip()),1))
         return {"retelling":"看见一颗星","events":[{"time":0.1,"visible":"一颗星","spoken":"看星星"}]}
 
-    def illustrate(self,prompt):
+    def illustrate(self,prompt,reference=None):
+        if prompt.startswith("为原创绘本绘制一张角色三视图参考卡"):
+            return Image.new("RGB",(960,540),"blue")
+        if self.enhanced:
+            self.assertIsNotNone(reference)
         i=int(re.search(r"地点(\d+)",prompt)[1])
         self.calls["image",i] += 1
         if i==self.fail_frame:
@@ -163,10 +201,12 @@ class PipelineTests(unittest.TestCase):
                 wav.writeframes(bytes(6400 if lang=="zh" else 9600))
             return stream.getvalue()
 
-    def start_video(self,picture,prompt,seconds,auth):
+    def start_video(self,picture,prompt,seconds,auth,*,reference=None):
         i=int(re.search(r"Shot (\d+)",prompt)[1])
         self.assertEqual(auth,"h3")
         self.assertTrue(4 <= seconds <= 15)
+        if self.enhanced:
+            self.assertIsNotNone(reference)
         if self.overlap:
             self.assertLess(abs(picture.getpixel((640,360))[0] - i*32),4)
         self.submissions.append(i)
@@ -186,10 +226,15 @@ class PipelineTests(unittest.TestCase):
             self.started["video2"].set()
         return {"status":"succeeded","video_url":"mock://fixture"}
 
-    def new_book(self,kind="text"):
+    def new_book(self,kind="text",enhanced=False):
+        self.enhanced = enhanced
         brief = dict(theme="星星",characters="小熊",setting="森林",education="观察") if kind=="text" else None
         settings = production.creation_settings(kind,"both",{},brief)
-        return production.initialize(self.root,"离线测试",settings)
+        book = production.initialize(self.root,"离线测试",settings)
+        if not enhanced:
+            book.pop("quality_version",None)
+            production.write(self.root,book)
+        return book
 
     def build(self):
         book=production.read(self.root)
@@ -237,6 +282,31 @@ class PipelineTests(unittest.TestCase):
         for language in ("zh","en"):
             self.assertTrue((dest/"assets"/shot["audio"][language]["spots"][replacement]).is_file())
 
+    def test_new_book_exports_checked_multishot_film_and_learning_evidence(self):
+        book = self.new_book(enhanced=True)
+        self.assertEqual(book.get("quality_version"),2)
+        moving_clip = self.clip.with_name("moving.mp4")
+        providers.run_binary(["ffmpeg","-nostdin","-loglevel","error","-f","lavfi","-i","color=red:s=160x90:r=24:d=1.1",
+            "-f","lavfi","-i","testsrc2=s=80x64:r=24:d=1.1","-filter_complex","[0:v][1:v]overlay=x='5+24*t':y=3",
+            "-c:v","libx264","-pix_fmt","yuv420p",str(moving_clip)],check=True,timeout=30)
+        with patch.object(providers,"fetch_media",return_value=moving_clip.read_bytes()):
+            book = self.build()
+        first = book["scenes"][0]
+        self.assertEqual(len(first["shot_plan"]),2)
+        self.assertEqual({ref for shot in first["shot_plan"] for ref in shot["plot_ids"]},set(first["plot_ids"]))
+        self.assertTrue(all(shot["video"] and shot["reference_image"] for shot in first["shot_plan"]))
+        self.assertEqual(len(first["film_review"]["motion"]["shots"]),2)
+        self.assertEqual(first["film_review"]["cast_issues"],[])
+        dest = self.root/"editions"/book["edition"]["id"]
+        plan = json.loads((dest/"制作稿.json").read_text(encoding="utf-8"))
+        self.assertEqual(plan["education_review"]["goals"][0]["quiz_indices"],[1])
+        self.assertEqual(plan["education_review"]["goals"][0]["hotspots"],[{"scene":"story-1","spot":"h1"}])
+        player = json.loads((dest/"book.js").read_text(encoding="utf-8").split("=",1)[1].strip().rstrip(";"))
+        exported = player["scenes"][0]
+        self.assertTrue(exported["cinematic"])
+        self.assertGreaterEqual(exported["audio"]["zh"]["duration"],first["video_seconds"])
+        self.assertEqual(exported["audio"]["zh"]["cues"],first["audio"]["zh"]["cues"])
+
     def test_resuming_automatic_retry_updates_full_edition_without_resubmitting(self):
         self.new_book()
         before = self.build()
@@ -254,10 +324,17 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(after["edition"],after["play_edition"])
         self.assertEqual(self.submissions.count(1),2)
 
-    def test_streamed_book_with_out_of_order_video_and_real_subtitle_timing(self):
+    def test_legacy_streamed_book_with_out_of_order_video_and_real_subtitle_timing(self):
         self.overlap=True
         self.writers=Barrier(6)
-        with patch.object(server,"StudioRSI"), server.LocalServer(("127.0.0.1",0),server.Handler) as http:
+        initialize = production.initialize
+        def legacy(root,name,creation=None):
+            book = initialize(root,name,creation)
+            book.pop("quality_version",None)
+            production.write(root,book)
+            return book
+        with patch.object(production,"initialize",side_effect=legacy), patch.object(server,"StudioRSI"), \
+             server.LocalServer(("127.0.0.1",0),server.Handler) as http:
             http.studio = server.Studio(self.root.parent)
             thread = Thread(target=http.serve_forever,daemon=True)
             thread.start()

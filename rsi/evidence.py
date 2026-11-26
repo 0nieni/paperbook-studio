@@ -46,7 +46,8 @@ def snapshot(root, book, edition=""):
         item = {k:s[k] for k in ("id","title","summary","visual","art_prompt","clean_review","rsi_used") if k in s}
         item.update(pages=[p["page"] for p in s.get("parts",[])], lines=sc.get("lines") or s.get("story_lines",[]),
                     spots=sc.get("spots",[]), video_prompt=sc.get("video_prompt",""),
-                    video=bool(s.get("video")), audio={l:t.get("duration") for l,t in s.get("audio",{}).items()})
+                    video=bool(s.get("video")),
+                    audio={l:t.get("narration_duration",t.get("duration")) for l,t in s.get("audio",{}).items()})
         if "interaction_spots" in s:
             item.update(spots=s["interaction_spots"],spot_frame="成片末帧")
         name = s.get("frame","")

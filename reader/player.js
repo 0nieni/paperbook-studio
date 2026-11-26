@@ -65,6 +65,7 @@ const $ = (id) => document.getElementById(id);
 const narration = $("narration");
 const explanation = $("explanation");
 const video = $("video");
+const transitionFrame = $("transition-frame");
 const quizDialog = $("quiz");
 const timeline = $("timeline");
 const rail = $("scenes");
@@ -146,13 +147,17 @@ function renderControls() {
 
 function syncVideo() {
   if (!state.playing || !state.videoReady || state.exploring || !video.duration) return;
-  const rate = video.duration / media[shots[state.shot].id].duration;
+  const rate = videoRate(shots[state.shot]);
   video.playbackRate = Math.max(.25, Math.min(2, rate));
   const targetTime = Math.min(video.duration - .025, narration.currentTime * video.playbackRate);
   if (Math.abs(video.currentTime - targetTime) > .19) video.currentTime = targetTime;
   if (video.paused && !video.ended && targetTime < video.duration - .05) {
     video.play().catch(() => {});
   }
+}
+
+function videoRate(shot) {
+  return shot.raw.cinematic ? 1 : Math.max(.25, Math.min(2, video.duration / media[shot.id].duration));
 }
 
 function stopExplanation() {
@@ -203,6 +208,11 @@ function play() {
 }
 
 function showShot(index, time = 0, autoplay = false) {
+  const previous = shots[state.shot];
+  const fade = index !== state.shot && autoplay && previous.raw.cinematic && shots[index].raw.cinematic &&
+    !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  transitionFrame?.getAnimations().forEach(animation => animation.cancel());
+  if (transitionFrame) transitionFrame.hidden = true;
   pause();
   stopExplanation();
   state.shot = index;
@@ -233,6 +243,12 @@ function showShot(index, time = 0, autoplay = false) {
   renderObjects();
   renderSuggestions();
   renderControls();
+  if (fade && transitionFrame) {
+    transitionFrame.src = asset(previous.raw.interaction_frame || previous.raw.frame);
+    transitionFrame.hidden = false;
+    const animation = transitionFrame.animate({opacity:[1,0]}, {duration:280,fill:"forwards"});
+    animation.onfinish = () => { transitionFrame.hidden = true; };
+  }
   if (autoplay) play();
 }
 
@@ -247,7 +263,7 @@ function seekTo(seconds, autoplay = state.playing) {
   }
   state.seek = offset;
   if (narration.readyState) narration.currentTime = offset;
-  if (state.videoReady) video.currentTime = Math.max(0, offset / media[shots[index].id].duration * video.duration - .02);
+  if (state.videoReady) video.currentTime = Math.max(0,Math.min(video.duration-.025,offset*videoRate(shots[index])));
   renderControls();
 }
 
